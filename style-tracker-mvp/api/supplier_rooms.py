@@ -191,12 +191,11 @@ async def upload_grn(
     s3_key = await s3_storage.upload_document(file, folder="grns")
     parsed = await openrouter_ai.parse_grn(content, mime)
 
-    # Compute received_quantity as sum of incoming_qty across all line items
     line_items = parsed.get("line_items") or []
     if not isinstance(line_items, list):
         line_items = []
     total_qty = sum(
-        float(item.get("incoming_qty") or 0)
+        float(item.get("expected_challan_qty") or item.get("incoming_qty") or 0)
         for item in line_items
         if isinstance(item, dict)
     ) or None
@@ -218,7 +217,7 @@ async def upload_grn(
             "challan_no": parsed.get("challan_no"),
             "challan_date": parsed.get("challan_date"),
             "vehicle_no": parsed.get("vehicle_no"),
-            "supplier_name": parsed.get("supplier_name") or supplier.name,
+            "party_name": parsed.get("party_name") or supplier.name,
             "line_items": line_items,
             "extra_fields": parsed.get("extra_fields", {}),
             "file_url": s3_key,
@@ -283,9 +282,74 @@ async def verify_grn(
     if payload.received_date:
         grn.received_date = payload.received_date
 
-    line_items = payload.line_items if payload.line_items is not None else grn.metadata_.get("line_items", [])
+    raw_items = payload.line_items if payload.line_items is not None else grn.metadata_.get("line_items", [])
+
+    # 3-stream reconciliation: compute variance and detect shortages per line item
+    enriched_items = []
+    shortage_items = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        expected = float(item.get("expected_challan_qty") or item.get("incoming_qty") or 0)
+        actual_raw = item.get("actual_received_qty")
+        if actual_raw is not None:
+            actual = float(actual_raw)
+            variance = actual - expected
+            enriched = {**item, "expected_challan_qty": expected, "actual_received_qty": actual, "variance": variance}
+            if variance < 0:
+                shortage_items.append({
+                    "item_name": item.get("item_name"),
+                    "unit": item.get("unit") or item.get("uom"),
+                    "expected_challan_qty": expected,
+                    "actual_received_qty": actual,
+                    "shortage_qty": abs(variance),
+                })
+        else:
+            enriched = {**item}
+        enriched_items.append(enriched)
+
+    is_discrepancy = len(shortage_items) > 0
+    debit_note_draft = None
+    if is_discrepancy:
+        # Resolve agreed_rate: prefer value stored on line item at ingest time, fall back to SPO
+        spo_result = await db.execute(select(SupplierPO).where(SupplierPO.id == grn.supplier_po_id))
+        spo_obj = spo_result.scalar_one_or_none()
+        po_rate_fallback = float(spo_obj.agreed_rate) if spo_obj and spo_obj.agreed_rate else 0.0
+
+        total_shortage = 0.0
+        total_penalty = 0.0
+        enriched_shortage_items = []
+        for s in shortage_items:
+            rate = s.get("agreed_rate") or po_rate_fallback
+            penalty = round(s["shortage_qty"] * rate, 2)
+            total_shortage += s["shortage_qty"]
+            total_penalty += penalty
+            enriched_shortage_items.append({**s, "agreed_rate": rate, "penalty_amount": penalty})
+
+        challan_ref = payload.challan_no or grn.metadata_.get("challan_no") or grn.grn_number
+        party = grn.metadata_.get("party_name") or grn.metadata_.get("supplier_name", "")
+        item_summary = ", ".join(
+            f"{s['shortage_qty']} {s['unit']} of {s['item_name']}" for s in enriched_shortage_items
+        )
+        auto_justification = (
+            f"Short delivery on challan {challan_ref}. Physical gate count recorded shortage: "
+            f"{item_summary}. Total penalty: ₹{round(total_penalty, 2)}."
+        )
+        debit_note_draft = {
+            "challan_no": challan_ref,
+            "party_name": party,
+            "raised_on_style": style_number,
+            "shortage_items": enriched_shortage_items,
+            "total_shortage_qty": total_shortage,
+            "total_penalty_amount": round(total_penalty, 2),
+            "justification": payload.justification or auto_justification,
+            "status": "DRAFT",
+        }
+
+    # received_quantity reflects actual gate count total (or expected if gate count not entered)
     grn.received_quantity = sum(
-        float(item.get("incoming_qty") or 0) for item in line_items if isinstance(item, dict)
+        float(item.get("actual_received_qty") or item.get("incoming_qty") or 0)
+        for item in enriched_items if isinstance(item, dict)
     ) or grn.received_quantity
 
     grn.metadata_ = {
@@ -293,8 +357,10 @@ async def verify_grn(
         "challan_no": payload.challan_no if payload.challan_no is not None else grn.metadata_.get("challan_no"),
         "challan_date": payload.challan_date if payload.challan_date is not None else grn.metadata_.get("challan_date"),
         "vehicle_no": payload.vehicle_no if payload.vehicle_no is not None else grn.metadata_.get("vehicle_no"),
-        "supplier_name": payload.supplier_name if payload.supplier_name is not None else grn.metadata_.get("supplier_name"),
-        "line_items": line_items,
+        "party_name": payload.supplier_name if payload.supplier_name is not None else grn.metadata_.get("party_name"),
+        "line_items": enriched_items,
+        "debit_note_draft": debit_note_draft,
+        "is_discrepancy": is_discrepancy,
         "is_draft": False,
         "verification_status": "VERIFIED",
     }
@@ -304,27 +370,86 @@ async def verify_grn(
 
 
 @router.post("/{supplier_id}/pos/{po_id}/grns", response_model=GRNResponse, status_code=status.HTTP_201_CREATED)
-async def create_grn(
+async def ingest_detailed_grn(
     style_number: str,
     supplier_id: int,
     po_id: int,
-    payload: GRNCreate,
+    file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    3-stream GRN ingest. Uploads challan to Supabase, runs targeted AI parser to extract
+    header metadata and per-line expected_challan_qty. Returns a draft GRN with a presigned
+    document_url so the frontend can render the split-screen confirmation view immediately.
+    """
     spo = await _require_supplier_po(db, po_id, style_number, supplier_id)
+    supplier = await _require_supplier(db, supplier_id)
+
+    content = await file.read()
+    mime = file.content_type or "application/pdf"
+    s3_key = await s3_storage.upload_document(file, folder="grns")
+    parsed = await openrouter_ai.parse_grn(content, mime)
+
+    raw_items = parsed.get("line_items") or []
+    if not isinstance(raw_items, list):
+        raw_items = []
+
+    # Inherit agreed_rate from the SPO so the verify step can compute penalty amounts
+    # without a second DB lookup.
+    po_rate = float(spo.agreed_rate) if spo.agreed_rate else None
+
+    line_items = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        line_items.append({
+            "item_name": item.get("item_name"),
+            "unit": item.get("unit") or item.get("uom"),
+            "expected_challan_qty": float(item.get("expected_challan_qty") or item.get("incoming_qty") or 0),
+            "actual_received_qty": None,
+            "variance": None,
+            "agreed_rate": po_rate,
+        })
+
+    total_expected = sum(i["expected_challan_qty"] for i in line_items) or None
+
+    received_date_raw = parsed.get("received_date") or parsed.get("challan_date")
+    try:
+        received_date = _dt.fromisoformat(str(received_date_raw)) if received_date_raw else _dt.utcnow()
+    except (ValueError, TypeError):
+        received_date = _dt.utcnow()
+
     grn = GRN(
         style_number=style_number,
         supplier_id=supplier_id,
         supplier_po_id=spo.id,
-        grn_number=payload.grn_number,
-        received_date=payload.received_date,
-        received_quantity=payload.received_quantity,
-        metadata_=payload.metadata_,
+        grn_number=parsed.get("grn_number") or f"DRAFT-{uuid.uuid4().hex[:8]}",
+        received_date=received_date,
+        received_quantity=total_expected,
+        metadata_={
+            "challan_no": parsed.get("challan_no"),
+            "challan_date": parsed.get("challan_date"),
+            "vehicle_no": parsed.get("vehicle_no"),
+            "party_name": parsed.get("party_name") or supplier.name,
+            "line_items": line_items,
+            "debit_note_draft": None,
+            "is_discrepancy": False,
+            "extra_fields": parsed.get("extra_fields", {}),
+            "file_url": s3_key,
+            "is_draft": True,
+            "verification_status": "PENDING_VERIFICATION",
+        },
     )
     db.add(grn)
     await db.flush()
     await db.refresh(grn)
-    return grn
+
+    resp = GRNResponse.model_validate(grn)
+    try:
+        resp.document_url = s3_storage.generate_presigned_url(s3_key)
+    except Exception:
+        pass
+    return resp
 
 
 # ── Supplier Invoices ─────────────────────────────────────────────────────────

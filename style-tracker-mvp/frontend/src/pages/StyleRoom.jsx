@@ -160,43 +160,48 @@ export default function StyleRoom() {
           </div>
         </div>
 
-        {/* Buyer PO details */}
-        <div className="bg-white rounded-xl border border-gray-200 p-5">
-          <p className="text-xs font-medium text-gray-500 mb-3 uppercase tracking-wide">Buyer PO Details</p>
-          <div className="grid grid-cols-2 md:grid-cols-3 gap-4 text-sm">
-            <Detail label="Style Number" value={caseData.style_number} mono />
-            <Detail label="Buyer" value={caseData.buyer_name} />
-            <Detail label="File" value={caseData.file_url ? (
+        {/* Buyer PO details + Size breakdown side by side */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+
+          {/* PO details card */}
+          <div className="bg-white rounded-xl border border-gray-200 p-5">
+            <p className="text-xs font-medium text-gray-500 mb-3 uppercase tracking-wide">Buyer PO Details</p>
+            <div className="grid grid-cols-2 gap-4 text-sm">
+              <Detail label="Style Number" value={caseData.style_number} mono />
+              <Detail label="Buyer" value={caseData.buyer_name} />
+              {caseData.metadata_?.sub_buyer_name && (
+                <Detail label="Sub-Buyer / Agent" value={caseData.metadata_.sub_buyer_name} />
+              )}
+              <Detail label="File" value={caseData.file_url ? (
+                <button
+                  onClick={() => openDocPanel(() => getCase(decoded), `Buyer PO — ${caseData.style_number}`)}
+                  className="text-indigo-600 hover:underline text-xs"
+                >
+                  View Document ↗
+                </button>
+              ) : '—'} />
+            </div>
+            <div className="mt-4 flex gap-2">
               <button
                 onClick={() => openDocPanel(() => getCase(decoded), `Buyer PO — ${caseData.style_number}`)}
-                className="text-indigo-600 hover:underline text-xs"
+                className="px-3 py-1.5 text-xs border border-gray-200 text-gray-600 rounded-lg hover:bg-gray-50 transition"
               >
-                View Document ↗
+                View PDF
               </button>
-            ) : '—'} />
-          </div>
-          <div className="mt-4 flex gap-2">
-            <button
-              onClick={() => openDocPanel(() => getCase(decoded), `Buyer PO — ${caseData.style_number}`)}
-              className="px-3 py-1.5 text-xs border border-gray-200 text-gray-600 rounded-lg hover:bg-gray-50 transition"
-            >
-              View PDF
-            </button>
-            <button
-              onClick={() => navigate(`/cases/${styleNumber}/verify`)}
-              className="px-3 py-1.5 text-xs border border-indigo-200 text-indigo-600 rounded-lg hover:bg-indigo-50 transition"
-            >
-              Edit PO Details
-            </button>
-          </div>
-          {caseData.metadata_ && Object.keys(caseData.metadata_).length > 0 && (
-            <div className="mt-4">
-              <p className="text-xs font-medium text-gray-400 mb-1.5">Metadata</p>
-              <div className="bg-gray-50 rounded-lg p-3 text-xs font-mono text-gray-600 overflow-x-auto max-h-32 overflow-y-auto">
-                {JSON.stringify(caseData.metadata_, null, 2)}
-              </div>
+              <button
+                onClick={() => navigate(`/cases/${styleNumber}/verify`)}
+                className="px-3 py-1.5 text-xs border border-indigo-200 text-indigo-600 rounded-lg hover:bg-indigo-50 transition"
+              >
+                Edit PO Details
+              </button>
             </div>
-          )}
+          </div>
+
+          {/* Size breakdown card */}
+          <SizeBreakdownCard
+            breakdown={caseData.metadata_?.size_breakdown}
+            totalQty={caseData.total_order_quantity}
+          />
         </div>
 
         {/* Supplier Rooms */}
@@ -296,6 +301,68 @@ function Detail({ label, value, mono = false }) {
     <div>
       <p className="text-xs text-gray-400 mb-0.5">{label}</p>
       <p className={`text-sm text-gray-800 ${mono ? 'font-mono' : ''}`}>{value ?? '—'}</p>
+    </div>
+  )
+}
+
+function SizeBreakdownCard({ breakdown, totalQty }) {
+  const hasBreakdown = breakdown && typeof breakdown === 'object' && Object.keys(breakdown).length > 0
+  const total = hasBreakdown
+    ? Object.values(breakdown).reduce((acc, v) => acc + (Number(v) || 0), 0)
+    : totalQty
+
+  return (
+    <div className="bg-white rounded-xl border border-gray-200 p-5">
+      <p className="text-xs font-medium text-gray-500 mb-3 uppercase tracking-wide">
+        Size-wise Order Breakdown
+      </p>
+
+      {hasBreakdown ? (
+        <>
+          <div className="space-y-1.5">
+            {Object.entries(breakdown).map(([size, qty]) => {
+              const pct = total > 0 ? ((Number(qty) / total) * 100).toFixed(1) : 0
+              return (
+                <div key={size} className="flex items-center gap-3">
+                  <span className="inline-flex items-center justify-center w-8 h-6 rounded bg-indigo-50 text-indigo-700 text-xs font-bold shrink-0">
+                    {size}
+                  </span>
+                  <div className="flex-1 bg-gray-100 rounded-full h-2 overflow-hidden">
+                    <div
+                      className="bg-indigo-400 h-full rounded-full transition-all"
+                      style={{ width: `${pct}%` }}
+                    />
+                  </div>
+                  <span className="text-xs font-mono text-gray-700 w-12 text-right shrink-0">
+                    {Number(qty).toLocaleString('en-IN')}
+                  </span>
+                  <span className="text-[10px] text-gray-400 w-8 text-right shrink-0">
+                    {pct}%
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+
+          {/* Total footer */}
+          <div className="mt-3 pt-3 border-t border-gray-100 flex items-center justify-between">
+            <span className="text-xs text-gray-500 font-medium">Total Order Qty</span>
+            <span className="text-base font-bold text-indigo-700 font-mono">
+              {Number(total).toLocaleString('en-IN')}
+              <span className="text-xs font-normal text-gray-400 ml-1">pcs</span>
+            </span>
+          </div>
+        </>
+      ) : (
+        <div className="flex flex-col items-center justify-center py-6 text-center">
+          <p className="text-xs text-gray-400">No size breakdown on file.</p>
+          {totalQty && (
+            <p className="text-xs text-gray-500 mt-1 font-medium">
+              Total: {Number(totalQty).toLocaleString('en-IN')} pcs
+            </p>
+          )}
+        </div>
+      )}
     </div>
   )
 }

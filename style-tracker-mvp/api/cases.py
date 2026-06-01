@@ -32,6 +32,13 @@ async def create_case(
     style_number = parsed.get("style_number") or f"DRAFT-{id(parsed)}"
     meta = {k: v for k, v in parsed.items() if k not in ("style_number", "buyer_name", "total_quantity", "total_value")}
 
+    # Derive total_quantity from size_breakdown when the AI provides a grid but no explicit total
+    total_qty = parsed.get("total_quantity")
+    if not total_qty:
+        breakdown = parsed.get("size_breakdown")
+        if isinstance(breakdown, dict) and breakdown:
+            total_qty = int(sum(v for v in breakdown.values() if isinstance(v, (int, float))))
+
     result = await db.execute(select(BuyerPO).where(BuyerPO.style_number == style_number))
     case = result.scalar_one_or_none()
 
@@ -43,7 +50,7 @@ async def create_case(
             )
         # Re-upload: refresh the draft with latest parse
         case.buyer_name = parsed.get("buyer_name") or case.buyer_name
-        case.total_order_quantity = parsed.get("total_quantity") or case.total_order_quantity
+        case.total_order_quantity = total_qty or case.total_order_quantity
         case.total_order_value = parsed.get("total_value") or case.total_order_value
         case.file_url = s3_key
         case.metadata_ = meta
@@ -51,7 +58,7 @@ async def create_case(
         case = BuyerPO(
             style_number=style_number,
             buyer_name=parsed.get("buyer_name") or "UNKNOWN",
-            total_order_quantity=parsed.get("total_quantity"),
+            total_order_quantity=total_qty,
             total_order_value=parsed.get("total_value"),
             file_url=s3_key,
             is_draft=True,
@@ -100,7 +107,8 @@ async def verify_case(
     if payload.total_order_value is not None:
         case.total_order_value = payload.total_order_value
     if payload.metadata_ is not None:
-        case.metadata_ = payload.metadata_
+        # Merge rather than replace so fields not touched by the verify form are preserved
+        case.metadata_ = {**case.metadata_, **payload.metadata_}
     case.is_draft = False
     case.verification_status = VerificationStatus.VERIFIED
     await db.flush()

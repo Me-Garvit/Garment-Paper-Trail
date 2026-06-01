@@ -28,7 +28,13 @@ export default function VerifyGRN() {
           supplier_name: meta.supplier_name || '',
         })
         const items = Array.isArray(meta.line_items) ? meta.line_items : []
-        setLineItems(items.length > 0 ? items : [{ item_name: '', incoming_qty: '', uom: 'PCS' }])
+        // Normalise: map expected_challan_qty → incoming_qty for the edit grid (backward compat)
+        const normalised = items.map(item => ({
+          ...item,
+          incoming_qty: item.incoming_qty ?? item.expected_challan_qty ?? '',
+          uom: item.uom ?? item.unit ?? 'PCS',
+        }))
+        setLineItems(normalised.length > 0 ? normalised : [{ item_name: '', incoming_qty: '', uom: 'PCS' }])
       })
       .catch(() => setError('Failed to load GRN.'))
   }, [decoded, supplierId, poId, grnId])

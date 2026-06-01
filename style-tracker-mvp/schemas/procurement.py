@@ -18,7 +18,8 @@ class GRNVerify(BaseModel):
     challan_date: str | None = None
     vehicle_no: str | None = None
     supplier_name: str | None = None
-    line_items: list[dict[str, Any]] | None = None   # [{item_name, incoming_qty, uom}]
+    line_items: list[dict[str, Any]] | None = None   # [{item_name, expected_challan_qty, actual_received_qty, unit}]
+    justification: str | None = None                  # manual override for debit note justification
 
 
 class GRNResponse(BaseModel):

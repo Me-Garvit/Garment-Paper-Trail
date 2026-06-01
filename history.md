@@ -24,6 +24,146 @@ The File Map must always reflect the live codebase. A new session or a different
 
 ---
 
+### Session 10 — 2026-06-01
+
+**Status:** Sub-buyer tracking and dynamic size-wise quantity breakdown added to the Buyer PO inception workflow. No schema migrations; all new fields stored in existing `metadata_` JSONB.
+
+**What was done:**
+
+1. **`services/openrouter_ai.py` — `DOCUMENT_PARSE_PROMPT` extended:**
+   - Added `"sub_buyer_name": null` — AI extracts any third-party brand, buying agent, or middleman distinct from the primary buyer.
+   - Added `"size_breakdown": {}` — AI extracts the full quantity grid (size token → integer qty), aggregating across colours if needed.
+   - Added enforcement rule: if `size_breakdown` is populated, `total_quantity` must equal the mathematical sum of all breakdown values.
+
+2. **`schemas/style_case.py` — `BuyerPOListItem` updated:**
+   - Added `metadata_: dict[str, Any] = {}` so the `GET /cases/` list response carries metadata to the Dashboard for sub-buyer display without an extra per-case request.
+
+3. **`api/cases.py` — `POST /cases/` and `PATCH /cases/{style_number}/verify` updated:**
+   - `create_case`: computes `total_qty` from `sum(size_breakdown.values())` when AI provides a grid but no explicit total.
+   - `verify_case`: changed from `case.metadata_ = payload.metadata_` (replace) to `{**case.metadata_, **payload.metadata_}` (merge) so fields not touched by the verify form are preserved.
+   - Both `sub_buyer_name` and `size_breakdown` flow naturally through the `meta` dict into `metadata_` JSONB — no additional column writes.
+
+4. **`frontend/src/pages/VerifyCase.jsx` — split-screen left panel updated:**
+   - New "Sub-Buyer / Agent" optional text input, pre-filled from `metadata_.sub_buyer_name`.
+   - Size breakdown section: loops through `metadata_.size_breakdown` keys, renders an editable numeric input per size token with a % distribution aside. Live read-only footer shows the rolling total (`sizeTotal`).
+   - When a size breakdown is present, the Total Order Qty field becomes read-only and auto-syncs to `sizeTotal`.
+   - "+ Add Size" button and per-row ✕ delete for manual edits.
+   - On confirm: sends `metadata_: { ...existing, sub_buyer_name, size_breakdown }` and uses `sizeTotal` as `total_order_quantity` when a breakdown exists.
+
+5. **`frontend/src/pages/Dashboard.jsx` — Buyer column updated:**
+   - Sub-buyer name rendered as an indigo sub-text line under buyer name (`via <sub_buyer_name>`) when present in `metadata_`.
+
+6. **`frontend/src/pages/StyleRoom.jsx` — PO Details section restructured:**
+   - PO details card and a new `SizeBreakdownCard` now sit in a 2-column grid.
+   - `SizeBreakdownCard`: renders each size with a proportional bar chart (CSS flex bar), qty, and % share. Total footer with formatted pcs count. Falls back to a plain total display when no breakdown is present.
+   - Sub-Buyer / Agent shown as a `<Detail>` row in the PO card when present.
+   - Raw JSON metadata dump removed (was replaced by the structured size card).
+
+**Changed files (no new files, no migrations):**
+- `style-tracker-mvp/services/openrouter_ai.py` — `DOCUMENT_PARSE_PROMPT` extended with `sub_buyer_name`, `size_breakdown`, and extraction rules
+- `style-tracker-mvp/schemas/style_case.py` — `BuyerPOListItem.metadata_` added
+- `style-tracker-mvp/api/cases.py` — size_breakdown fallback for `total_quantity`; metadata merge on verify
+- `style-tracker-mvp/frontend/src/pages/VerifyCase.jsx` — sub-buyer input, size breakdown table, live total
+- `style-tracker-mvp/frontend/src/pages/Dashboard.jsx` — sub-buyer sub-text in Buyer column
+- `style-tracker-mvp/frontend/src/pages/StyleRoom.jsx` — `SizeBreakdownCard` component, sub-buyer detail, PO details restructured
+
+**Next Steps (pick up here in Session 11):**
+1. Test with a real buyer PO that has a size grid — verify AI fills `size_breakdown` correctly.
+2. Check `verify_case` metadata merge doesn't double-nest `size_breakdown` on re-verify.
+3. Style the size bar chart with a fixed width container to prevent overflow on small screens.
+
+---
+
+### Session 9 — 2026-06-01 (branch: feature/advanced-grn)
+
+**Status:** Single-upload GRN subsystem finalised — dual-upload requirement eliminated, financial penalty engine added to debit note, editable justification wired end-to-end.
+
+**What was done:**
+
+1. **`schemas/procurement.py`** — `GRNVerify.justification: str | None` added. Allows the frontend to pass a user-edited debit note justification at verify time; if omitted the backend auto-generates it.
+
+2. **`api/supplier_rooms.py` — `ingest_detailed_grn` (POST /grns):**
+   - Each line item now stores `"agreed_rate": po_rate` (inherited from `SupplierPO.agreed_rate`) at ingest time so the verify step can compute penalty amounts without a second DB round-trip.
+
+3. **`api/supplier_rooms.py` — `verify_grn` (PATCH .../verify):**
+   - Resolves `agreed_rate` per shortage item: uses value stored on the line item at ingest; falls back to a single SPO lookup for older GRNs.
+   - Computes `penalty_amount = shortage_qty × rate` per shortage item.
+   - `debit_note_draft` now includes `total_penalty_amount`, per-item `penalty_amount`, and uses `payload.justification` if supplied (auto-generates otherwise).
+
+4. **`frontend/src/pages/SupplierRoom.jsx` — complete refactor:**
+   - **Dual-upload eliminated.** Removed `uploadGRN` import, `showGRNUpload`/`uploadingGRN` states, `handleGRNUpload`, and the old "+ Upload GRN" modal. Single trigger: "+ Ingest Detailed GRN" (violet button).
+   - **Upload modal** explicitly asks for the Supplier Delivery Challan PDF.
+   - **Default gate count = expected challan qty** (`actual_received_qty` initialised to `String(expected_challan_qty)`). Operator only edits rows with actual shortages — rapid entry pattern.
+   - **Debit Note Summary card** (auto-renders on any shortage):
+     - Per-item breakdown: item name · shortage qty · rate · `penalty_amount` in ₹
+     - Total Penalty Amount row (shown only when `agreed_rate > 0`)
+     - Editable `<textarea>` for manual justification (pre-placeholder = auto-generated text)
+   - **Commit button** label: `"Log GRN & Create Debit Note"` (red) when shortages exist; `"Log GRN"` (indigo) when clean.
+   - `handleLogGRN` compiles header, manual counts, `agreed_rate`, and justification into a single JSON body and PATCHes `/verify`.
+
+**Changed files (no new files, no migrations):**
+- `style-tracker-mvp/schemas/procurement.py` — `GRNVerify.justification` added
+- `style-tracker-mvp/api/supplier_rooms.py` — `ingest_detailed_grn` stores `agreed_rate` per line item; `verify_grn` computes penalty + accepts justification
+- `style-tracker-mvp/frontend/src/pages/SupplierRoom.jsx` — single-upload flow, penalty card, justification textarea
+
+**Next Steps (pick up here in Session 10):**
+1. End-to-end test: upload a real challan PDF → verify AI extracts `expected_challan_qty` → lower one gate count → confirm Debit Note card appears with correct ₹ penalty.
+2. Check `is_discrepancy` + `debit_note_draft.total_penalty_amount` are persisted in the GRN JSONB.
+3. Wire the SHORTAGE badge in the GRN list to link/expand the saved debit note detail.
+4. Revisit `VerifyGRN.jsx` — display `expected_challan_qty` / `actual_received_qty` columns (currently shows legacy `incoming_qty`).
+
+---
+
+### Session 8 — 2026-06-01 (branch: feature/advanced-grn)
+
+**Status:** Advanced 3-stream GRN subsystem implemented — Supplier Challan vs. Manual Gate Count vs. Debit Note Reconciliation.
+
+**What was done:**
+
+1. **`services/openrouter_ai.py` — Targeted GRN parser prompt refactored:**
+   - `GRN_PARSE_PROMPT` updated: `supplier_name` → `party_name` (challan party), `incoming_qty` → `expected_challan_qty`, `uom` → `unit`.
+   - `parse_grn()` unchanged in signature — uses updated prompt automatically via same OpenRouter → DeepSeek+pypdf fallback chain.
+
+2. **`api/supplier_rooms.py` — `POST /{supplier_id}/pos/{po_id}/grns` rebuilt as 3-stream ingest:**
+   - Old `create_grn` (JSON body) replaced by `ingest_detailed_grn` (UploadFile).
+   - Uploads to Supabase storage via httpx REST engine (no boto3), runs `parse_grn`, builds 3-stream line items: `{ item_name, unit, expected_challan_qty, actual_received_qty: null, variance: null }`. Saves draft into JSONB `metadata_`.
+   - Generates presigned URL immediately in POST response (so frontend split-screen can render inline without a follow-up GET).
+   - `verify_grn` (PATCH) extended with 3-stream reconciliation engine: for each item with `actual_received_qty` present, computes `variance = actual − expected`. Items with `variance < 0` are collected into a `debit_note_draft` object saved into JSONB: `{ challan_no, party_name, raised_on_style, shortage_items[], total_shortage_qty, justification, status: "DRAFT" }`. Sets `is_discrepancy: true` on the GRN if any shortage. `received_quantity` updated to reflect gate count total.
+
+3. **`api/client.js` — `createGRN` replaced by `ingestDetailedGRN`:**
+   - `createGRN` (JSON POST to `/grns`) removed — dead code (referenced undeclared state in SupplierRoom).
+   - `ingestDetailedGRN(styleNumber, supplierId, poId, file)` added — multipart POST to `/grns`.
+
+4. **`frontend/src/pages/SupplierRoom.jsx` — 3-stream split-screen confirmation layout:**
+   - Added "+ Ingest Detailed GRN" button alongside existing "+ Upload GRN" in the GRN section header.
+   - `handleDetailedGRNUpload`: calls `ingestDetailedGRN`, receives parsed challan + presigned URL, sets `detailedGRNMode` state (no page navigation — in-page split-screen activates).
+   - `updateGateCount`: updates per-item actual_received_qty in local state.
+   - `handleLogGRN`: calls `verifyGRN` with enriched line items (expected + actual), collapses split-screen on success.
+   - Split-screen overlay (`fixed inset-0 z-50`):
+     - **Right half:** iframe rendering challan PDF via presigned Supabase URL.
+     - **Left half:** 3-stream validation grid: `[Challan Exp. Qty (AI)] | [Physical Gate Count (input)] | [Computed Variance]`. Shortage rows highlighted red. If `variance < 0` on any item: inline `RAW MATERIAL LOSS DETECTED` alert badge + pre-filled Debit Note panel showing shortage breakdown and auto-generated justification text.
+   - "Log GRN" button label dynamically reads "Log GRN + Flag Shortage" when shortages are detected. Existing GRN list badge shows `SHORTAGE` tag on committed GRNs with `is_discrepancy: true`.
+
+**Changed files (no new files, no migrations):**
+- `style-tracker-mvp/services/openrouter_ai.py` — GRN_PARSE_PROMPT field names updated
+- `style-tracker-mvp/api/supplier_rooms.py` — `create_grn` → `ingest_detailed_grn`; `verify_grn` extended with 3-stream reconciliation
+- `style-tracker-mvp/frontend/src/api/client.js` — `createGRN` → `ingestDetailedGRN`
+- `style-tracker-mvp/frontend/src/pages/SupplierRoom.jsx` — 3-stream split-screen GRN confirmation UI
+
+**API changes:**
+- `POST /cases/{style_number}/suppliers/{supplier_id}/pos/{po_id}/grns` — now accepts `multipart/form-data` file upload (was JSON). Returns GRN draft with `document_url` presigned URL.
+- `PATCH .../grns/{grn_id}/verify` — now evaluates 3-stream variance, persists `debit_note_draft` and `is_discrepancy` in JSONB.
+
+**No new routes, no schema migrations, no boto3. All storage via Supabase httpx REST.**
+
+**Next Steps (pick up here in Session 9):**
+1. Test `POST /grns` with a real challan PDF — verify `expected_challan_qty` is parsed correctly.
+2. Test split-screen: enter gate counts, check variance + debit note panel appear correctly.
+3. Confirm PATCH verify persists `debit_note_draft` in JSONB and `is_discrepancy` flag shows on GRN list.
+4. Revisit `VerifyGRN.jsx` — update to display `expected_challan_qty`/`actual_received_qty` columns for GRNs ingested via the new route (currently shows old `incoming_qty` field).
+
+---
+
 ### Session 7 — 2026-05-31
 
 **Status:** Document side-panel viewer + re-edit capability added to all record types. GRN ingestion upgraded to full AI-extracted line-item framework.

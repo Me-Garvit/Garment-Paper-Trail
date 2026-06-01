@@ -98,7 +98,14 @@ export default function Dashboard() {
                     <td className="px-4 py-3 font-mono font-medium text-indigo-700 text-xs">
                       {c.style_number}
                     </td>
-                    <td className="px-4 py-3 text-gray-700">{c.buyer_name}</td>
+                    <td className="px-4 py-3">
+                      <p className="text-gray-700">{c.buyer_name}</p>
+                      {c.metadata_?.sub_buyer_name && (
+                        <p className="text-[10px] text-indigo-500 font-medium mt-0.5">
+                          via {c.metadata_.sub_buyer_name}
+                        </p>
+                      )}
+                    </td>
                     <td className="px-4 py-3 text-right text-gray-700">
                       {c.total_order_quantity?.toLocaleString() ?? '—'}
                     </td>

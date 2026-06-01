@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import {
   listSupplierPOs, uploadSupplierPO, getSupplierPO,
-  listGRNs, uploadGRN,
+  listGRNs, ingestDetailedGRN, verifyGRN,
   listInvoices, uploadInvoice, getSupplierInvoice,
 } from '../api/client'
 import DiscrepancyFlags from '../components/DiscrepancyFlags'
@@ -21,8 +21,13 @@ export default function SupplierRoom() {
   const [grns, setGRNs] = useState([])
   const [showPOUpload, setShowPOUpload] = useState(false)
   const [uploadingPO, setUploadingPO] = useState(false)
-  const [showGRNUpload, setShowGRNUpload] = useState(false)
-  const [uploadingGRN, setUploadingGRN] = useState(false)
+  const [showChallanUpload, setShowChallanUpload] = useState(false)
+  const [uploadingChallan, setUploadingChallan] = useState(false)
+  // detailedGRNMode: null | { grnId, documentUrl, grnNumber, challanNo, partyName, lineItems }
+  // lineItems: [{ item_name, unit, expected_challan_qty, actual_received_qty (string), agreed_rate }]
+  const [detailedGRNMode, setDetailedGRNMode] = useState(null)
+  const [savingGRN, setSavingGRN] = useState(false)
+  const [dnJustification, setDnJustification] = useState('')
   const [showInvoiceUpload, setShowInvoiceUpload] = useState(false)
   const [uploadingInvoice, setUploadingInvoice] = useState(false)
   const [error, setError] = useState(null)
@@ -38,11 +43,8 @@ export default function SupplierRoom() {
     }
   }
 
-  const loadPOs = () =>
-    listSupplierPOs(decoded, supplierId).then(setPOs).catch(() => {})
-
-  const loadInvoices = () =>
-    listInvoices(decoded, supplierId).then(setInvoices).catch(() => {})
+  const loadPOs = () => listSupplierPOs(decoded, supplierId).then(setPOs).catch(() => {})
+  const loadInvoices = () => listInvoices(decoded, supplierId).then(setInvoices).catch(() => {})
 
   useEffect(() => {
     loadPOs()
@@ -58,17 +60,100 @@ export default function SupplierRoom() {
     loadGRNs(po.id)
   }
 
-  const handleGRNUpload = async (file) => {
+  // Single-upload handler: uploads the Supplier Delivery Challan, AI parses it,
+  // then opens the side-by-side verification layout in-page.
+  const handleChallanUpload = async (file) => {
     if (!selectedPO) return
-    setUploadingGRN(true)
+    setUploadingChallan(true)
+    setError(null)
     try {
-      const grn = await uploadGRN(decoded, supplierId, selectedPO.id, file)
-      setShowGRNUpload(false)
-      loadGRNs(selectedPO.id)
-      navigate(`/cases/${styleNumber}/suppliers/${supplierId}/pos/${selectedPO.id}/grns/${grn.id}/verify`)
+      const grn = await ingestDetailedGRN(decoded, supplierId, selectedPO.id, file)
+      setShowChallanUpload(false)
+      const meta = grn.metadata_ || {}
+      // Default actual_received_qty = expected_challan_qty for rapid entry.
+      // Operator only needs to correct rows with an actual shortage.
+      const lineItems = (meta.line_items || []).map(item => ({
+        item_name: item.item_name || '',
+        unit: item.unit || 'PCS',
+        expected_challan_qty: Number(item.expected_challan_qty) || 0,
+        actual_received_qty: String(Number(item.expected_challan_qty) || 0),
+        agreed_rate: item.agreed_rate ?? null,
+      }))
+      setDetailedGRNMode({
+        grnId: grn.id,
+        documentUrl: grn.document_url || null,
+        grnNumber: grn.grn_number || '',
+        challanNo: meta.challan_no || '',
+        partyName: meta.party_name || '',
+        lineItems,
+      })
+      setDnJustification('')
     } catch (e) {
-      setError(e.response?.data?.detail ?? 'GRN upload failed')
-      setUploadingGRN(false)
+      setError(e.response?.data?.detail ?? 'Challan ingest failed')
+    } finally {
+      setUploadingChallan(false)
+    }
+  }
+
+  const updateGateCount = (idx, value) => {
+    setDetailedGRNMode(prev => ({
+      ...prev,
+      lineItems: prev.lineItems.map((item, i) =>
+        i === idx ? { ...item, actual_received_qty: value } : item
+      ),
+    }))
+  }
+
+  // variance = actual - expected (negative = shortage)
+  const itemVariance = (item) => {
+    if (item.actual_received_qty === '') return null
+    const gate = Number(item.actual_received_qty)
+    if (isNaN(gate)) return null
+    return gate - item.expected_challan_qty
+  }
+
+  const handleLogGRN = async () => {
+    if (!detailedGRNMode || !selectedPO) return
+    setSavingGRN(true)
+    setError(null)
+    try {
+      const items = detailedGRNMode.lineItems.map(item => ({
+        item_name: item.item_name,
+        unit: item.unit,
+        expected_challan_qty: item.expected_challan_qty,
+        actual_received_qty: item.actual_received_qty !== '' ? Number(item.actual_received_qty) : null,
+        agreed_rate: item.agreed_rate,
+      }))
+
+      // Build the justification: user text overrides the auto-generated summary
+      const shortages = detailedGRNMode.lineItems.filter(i => {
+        const v = itemVariance(i)
+        return v !== null && v < 0
+      })
+      const totalPenalty = shortages.reduce((acc, item) => {
+        const shortage = item.expected_challan_qty - Number(item.actual_received_qty)
+        return acc + shortage * (item.agreed_rate || selectedPO.agreed_rate || 0)
+      }, 0)
+      const autoJustification = shortages.length > 0
+        ? `Short delivery on Challan ${detailedGRNMode.challanNo || detailedGRNMode.grnNumber}` +
+          `${detailedGRNMode.partyName ? ` from ${detailedGRNMode.partyName}` : ''}. ` +
+          `Physical gate count recorded ${shortages.length} item shortage(s). ` +
+          `Total penalty: ₹${totalPenalty.toLocaleString('en-IN', { minimumFractionDigits: 2 })}.`
+        : ''
+
+      await verifyGRN(decoded, supplierId, selectedPO.id, detailedGRNMode.grnId, {
+        grn_number: detailedGRNMode.grnNumber || undefined,
+        challan_no: detailedGRNMode.challanNo || undefined,
+        line_items: items,
+        justification: (dnJustification.trim() || autoJustification) || undefined,
+      })
+      setDetailedGRNMode(null)
+      setDnJustification('')
+      loadGRNs(selectedPO.id)
+    } catch (e) {
+      setError(e.response?.data?.detail ?? 'Failed to log GRN')
+    } finally {
+      setSavingGRN(false)
     }
   }
 
@@ -85,25 +170,6 @@ export default function SupplierRoom() {
     }
   }
 
-  const handleAddGRN = async () => {
-    if (!selectedPO || !grnForm.grn_number || !grnForm.received_date) return
-    setSavingGRN(true)
-    try {
-      await createGRN(decoded, supplierId, selectedPO.id, {
-        grn_number: grnForm.grn_number,
-        received_date: new Date(grnForm.received_date).toISOString(),
-        received_quantity: grnForm.received_quantity ? Number(grnForm.received_quantity) : null,
-      })
-      setGRNForm({ grn_number: '', received_date: '', received_quantity: '' })
-      setShowAddGRN(false)
-      loadGRNs(selectedPO.id)
-    } catch (e) {
-      setError(e.response?.data?.detail ?? 'Failed to log GRN')
-    } finally {
-      setSavingGRN(false)
-    }
-  }
-
   const handleInvoiceUpload = async (file) => {
     setUploadingInvoice(true)
     try {
@@ -116,6 +182,29 @@ export default function SupplierRoom() {
       setUploadingInvoice(false)
     }
   }
+
+  // Derived: shortage line items where actual < challan expected
+  const shortageItems = detailedGRNMode
+    ? detailedGRNMode.lineItems.filter(item => {
+        const v = itemVariance(item)
+        return v !== null && v < 0
+      })
+    : []
+
+  const poRate = selectedPO?.agreed_rate ?? 0
+
+  const totalPenaltyAmt = shortageItems.reduce((acc, item) => {
+    const shortage = item.expected_challan_qty - Number(item.actual_received_qty)
+    const rate = item.agreed_rate ?? poRate
+    return acc + shortage * rate
+  }, 0)
+
+  const autoJustificationText = detailedGRNMode && shortageItems.length > 0
+    ? `Short delivery on Challan ${detailedGRNMode.challanNo || detailedGRNMode.grnNumber}` +
+      `${detailedGRNMode.partyName ? ` from ${detailedGRNMode.partyName}` : ''}. ` +
+      `Physical gate count recorded ${shortageItems.length} item shortage(s). ` +
+      `Total penalty: ₹${totalPenaltyAmt.toLocaleString('en-IN', { minimumFractionDigits: 2 })}.`
+    : ''
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -203,14 +292,14 @@ export default function SupplierRoom() {
                 <div>
                   <p className="text-sm font-semibold text-gray-900">GRNs for {selectedPO.supplier_po_number}</p>
                   <p className="text-xs text-gray-400 mt-0.5">
-                    Budget: {selectedPO.ordered_quantity ?? '—'} units @ ₹{selectedPO.agreed_rate ?? '—'}
+                    Budget: {selectedPO.ordered_quantity ?? '—'} units @ ₹{selectedPO.agreed_rate ?? '—'}/unit
                   </p>
                 </div>
                 <button
-                  onClick={() => setShowGRNUpload(true)}
-                  className="text-xs text-indigo-600 hover:text-indigo-800 font-medium"
+                  onClick={() => setShowChallanUpload(true)}
+                  className="text-xs font-medium px-3 py-1.5 rounded-lg bg-violet-600 text-white hover:bg-violet-700 transition"
                 >
-                  + Upload GRN
+                  + Ingest Detailed GRN
                 </button>
               </div>
 
@@ -229,7 +318,12 @@ export default function SupplierRoom() {
                   <tbody>
                     {grns.map(g => (
                       <tr key={g.id} className="border-b border-gray-50 hover:bg-gray-50">
-                        <td className="px-4 py-2.5 font-mono text-gray-700">{g.grn_number}</td>
+                        <td className="px-4 py-2.5 font-mono text-gray-700">
+                          {g.grn_number}
+                          {g.metadata_?.is_discrepancy && (
+                            <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded bg-red-100 text-red-600 text-[10px] font-semibold">SHORTAGE</span>
+                          )}
+                        </td>
                         <td className="px-4 py-2.5 text-right text-gray-700">{g.received_quantity ?? '—'}</td>
                         <td className="px-4 py-2.5 text-right text-gray-400">
                           {g.received_date ? new Date(g.received_date).toLocaleDateString('en-IN') : '—'}
@@ -250,7 +344,7 @@ export default function SupplierRoom() {
                       <td className="px-4 py-2 text-right font-semibold text-gray-800">
                         {grns.reduce((acc, g) => acc + (Number(g.received_quantity) || 0), 0).toLocaleString()}
                       </td>
-                      <td />
+                      <td /><td />
                     </tr>
                   </tbody>
                 </table>
@@ -308,7 +402,7 @@ export default function SupplierRoom() {
                             onClick={() => openDocPanel(() => getSupplierInvoice(decoded, supplierId, inv.id), `Invoice ${inv.invoice_number}`)}
                             className="p-1 text-gray-300 hover:text-indigo-500 transition"
                           >
-                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 116 0z"/><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
                           </button>
                         )}
                       </td>
@@ -321,23 +415,17 @@ export default function SupplierRoom() {
         </div>
       </main>
 
-      {showGRNUpload && selectedPO && (
+      {/* ── Modals ─────────────────────────────────────────────────────────────── */}
+
+      {showChallanUpload && selectedPO && (
         <UploadModal
-          title="Upload Delivery Challan / GRN"
-          description={`PO: ${selectedPO.supplier_po_number}. AI will extract challan number, vehicle, and all line items.`}
-          onUpload={handleGRNUpload}
-          onClose={() => setShowGRNUpload(false)}
-          loading={uploadingGRN}
+          title="Upload Supplier Delivery Challan"
+          description={`PO: ${selectedPO.supplier_po_number} · ₹${selectedPO.agreed_rate ?? '—'}/unit. Upload the supplier's delivery challan PDF. AI extracts challan header and per-item expected quantities automatically.`}
+          onUpload={handleChallanUpload}
+          onClose={() => setShowChallanUpload(false)}
+          loading={uploadingChallan}
         />
       )}
-
-      <DocumentPanel
-        isOpen={docPanel.open}
-        onClose={() => setDocPanel(p => ({ ...p, open: false }))}
-        url={docPanel.url}
-        title={docPanel.title}
-        loading={docPanel.loading}
-      />
 
       {showPOUpload && (
         <UploadModal
@@ -357,6 +445,263 @@ export default function SupplierRoom() {
           onClose={() => setShowInvoiceUpload(false)}
           loading={uploadingInvoice}
         />
+      )}
+
+      <DocumentPanel
+        isOpen={docPanel.open}
+        onClose={() => setDocPanel(p => ({ ...p, open: false }))}
+        url={docPanel.url}
+        title={docPanel.title}
+        loading={docPanel.loading}
+      />
+
+      {/* ── Side-by-side GRN Verification Layout ────────────────────────────── */}
+
+      {detailedGRNMode && (
+        <div className="fixed inset-0 z-50 flex bg-white" style={{ top: '65px' }}>
+
+          {/* ── Left: Interactive logging table ── */}
+          <div className="w-1/2 border-r border-gray-200 flex flex-col overflow-y-auto bg-white">
+
+            {/* Header */}
+            <div className="p-5 border-b border-gray-100 flex items-center justify-between shrink-0">
+              <div>
+                <h2 className="text-base font-semibold text-gray-900">GRN Verification — Gate Count Entry</h2>
+                <p className="text-xs text-gray-400 mt-0.5">
+                  {detailedGRNMode.challanNo && `Challan ${detailedGRNMode.challanNo}`}
+                  {detailedGRNMode.partyName && ` · ${detailedGRNMode.partyName}`}
+                  {selectedPO?.agreed_rate && ` · ₹${selectedPO.agreed_rate}/unit`}
+                </p>
+              </div>
+              <button
+                onClick={() => { setDetailedGRNMode(null); setDnJustification(''); setError(null) }}
+                className="text-xs text-gray-400 hover:text-gray-700 px-2 py-1 rounded hover:bg-gray-100 transition"
+              >
+                ✕ Cancel
+              </button>
+            </div>
+
+            <div className="p-5 flex-1 space-y-4">
+              {error && (
+                <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg px-4 py-3 text-sm">{error}</div>
+              )}
+
+              {/* Stream legend */}
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-gray-400">
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-indigo-300 inline-block" />
+                  Challan Expected Qty (AI-extracted)
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-violet-400 inline-block" />
+                  Actual Physical Count (editable)
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-red-400 inline-block" />
+                  Variance (auto-computed)
+                </span>
+              </div>
+
+              {/* Main logging table */}
+              <div className="border border-gray-200 rounded-lg overflow-hidden">
+                <div className="grid grid-cols-[1fr_100px_120px_80px] bg-gray-50 border-b border-gray-200 px-3 py-2 text-[10px] text-gray-400 uppercase tracking-wide font-medium gap-2">
+                  <span>Item</span>
+                  <span className="text-right">Challan Qty</span>
+                  <span className="text-center">Actual Count</span>
+                  <span className="text-right">Variance</span>
+                </div>
+
+                {detailedGRNMode.lineItems.map((item, idx) => {
+                  const variance = itemVariance(item)
+                  const isShortage = variance !== null && variance < 0
+                  const isExcess = variance !== null && variance > 0
+
+                  return (
+                    <div
+                      key={idx}
+                      className={`grid grid-cols-[1fr_100px_120px_80px] items-center px-2 py-2.5 border-b border-gray-100 last:border-0 gap-2 ${isShortage ? 'bg-red-50/60' : ''}`}
+                    >
+                      <div>
+                        <p className="text-xs text-gray-800 font-medium leading-tight">{item.item_name || '—'}</p>
+                        <p className="text-[10px] text-gray-400">{item.unit}</p>
+                      </div>
+                      <p className="text-xs text-right text-indigo-700 font-mono pr-1 font-medium">
+                        {item.expected_challan_qty.toLocaleString('en-IN')}
+                      </p>
+                      <input
+                        type="number"
+                        min="0"
+                        value={item.actual_received_qty}
+                        onChange={e => updateGateCount(idx, e.target.value)}
+                        className={`text-xs px-2 py-1.5 border rounded focus:outline-none text-right w-full font-mono ${isShortage ? 'border-red-300 bg-red-50 focus:border-red-500' : 'border-gray-200 focus:border-violet-400'}`}
+                      />
+                      <div className="text-right pr-1">
+                        {variance === null ? (
+                          <span className="text-[10px] text-gray-300">—</span>
+                        ) : isShortage ? (
+                          <span className="inline-flex items-center px-1.5 py-0.5 rounded bg-red-100 text-red-700 text-[10px] font-bold">
+                            {variance.toLocaleString('en-IN')}
+                          </span>
+                        ) : isExcess ? (
+                          <span className="text-[10px] text-amber-600 font-mono font-medium">+{variance.toLocaleString('en-IN')}</span>
+                        ) : (
+                          <span className="text-[10px] text-green-600 font-mono">✓</span>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+
+                {/* Totals row */}
+                <div className="grid grid-cols-[1fr_100px_120px_80px] items-center px-3 py-2 bg-gray-50 border-t border-gray-200 gap-2">
+                  <span className="text-[10px] text-gray-500 font-semibold uppercase tracking-wide">Totals</span>
+                  <span className="text-xs text-right text-indigo-700 font-semibold font-mono pr-1">
+                    {detailedGRNMode.lineItems.reduce((acc, i) => acc + i.expected_challan_qty, 0).toLocaleString('en-IN')}
+                  </span>
+                  <span className="text-xs text-right text-violet-700 font-semibold font-mono">
+                    {detailedGRNMode.lineItems
+                      .reduce((acc, i) => acc + (i.actual_received_qty !== '' ? Number(i.actual_received_qty) || 0 : 0), 0)
+                      .toLocaleString('en-IN')}
+                  </span>
+                  <span className="text-right pr-1">
+                    {(() => {
+                      const totalV = detailedGRNMode.lineItems.reduce((acc, i) => {
+                        const v = itemVariance(i)
+                        return v !== null ? acc + v : acc
+                      }, 0)
+                      const hasAny = detailedGRNMode.lineItems.some(i => itemVariance(i) !== null)
+                      if (!hasAny) return null
+                      return (
+                        <span className={`text-xs font-mono font-semibold ${totalV < 0 ? 'text-red-600' : totalV > 0 ? 'text-amber-600' : 'text-green-600'}`}>
+                          {totalV > 0 ? '+' : ''}{totalV.toLocaleString('en-IN')}
+                        </span>
+                      )
+                    })()}
+                  </span>
+                </div>
+              </div>
+
+              {/* Debit Note Summary card — appears automatically on any shortage */}
+              {shortageItems.length > 0 && (
+                <div className="rounded-lg border border-orange-200 bg-orange-50 overflow-hidden">
+                  {/* DN Header */}
+                  <div className="flex items-center justify-between px-4 py-3 bg-orange-100 border-b border-orange-200">
+                    <div className="flex items-center gap-2">
+                      <span className="inline-flex items-center px-2 py-0.5 rounded-full bg-red-100 text-red-700 text-[10px] font-bold tracking-wide uppercase">
+                        Debit Note Summary
+                      </span>
+                      <span className="text-xs text-orange-700 font-medium">
+                        {shortageItems.length} item{shortageItems.length > 1 ? 's' : ''} short
+                      </span>
+                    </div>
+                    <span className="text-sm font-bold text-red-700 font-mono">
+                      −₹{totalPenaltyAmt.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                    </span>
+                  </div>
+
+                  <div className="p-4 space-y-3">
+                    {/* Per-item penalty breakdown */}
+                    <div className="space-y-1.5">
+                      {shortageItems.map((item, i) => {
+                        const shortage = item.expected_challan_qty - Number(item.actual_received_qty)
+                        const rate = item.agreed_rate ?? poRate
+                        const penalty = shortage * rate
+                        return (
+                          <div key={i} className="grid grid-cols-[1fr_auto] items-center bg-white rounded px-3 py-2 border border-orange-100 gap-4">
+                            <div>
+                              <p className="text-xs text-gray-800 font-medium">{item.item_name}</p>
+                              <p className="text-[10px] text-gray-400 mt-0.5">
+                                Received {Number(item.actual_received_qty).toLocaleString('en-IN')} of {item.expected_challan_qty.toLocaleString('en-IN')} {item.unit}
+                                {rate > 0 && ` · ₹${rate}/unit`}
+                              </p>
+                            </div>
+                            <div className="text-right shrink-0">
+                              <p className="text-xs font-mono text-red-600 font-semibold">−{shortage.toLocaleString('en-IN')} {item.unit}</p>
+                              {rate > 0 && (
+                                <p className="text-[10px] text-red-500 font-mono mt-0.5">
+                                  ₹{penalty.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                                </p>
+                              )}
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+
+                    {/* Total penalty row */}
+                    {poRate > 0 && (
+                      <div className="flex items-center justify-between bg-red-50 border border-red-200 rounded px-3 py-2">
+                        <span className="text-xs font-semibold text-red-700">Total Penalty Amount</span>
+                        <span className="text-sm font-bold font-mono text-red-700">
+                          ₹{totalPenaltyAmt.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                        </span>
+                      </div>
+                    )}
+
+                    {/* Editable justification textarea */}
+                    <div>
+                      <label className="block text-[10px] text-orange-600 font-medium uppercase tracking-wide mb-1.5">
+                        Debit Note Justification
+                      </label>
+                      <textarea
+                        rows={3}
+                        value={dnJustification}
+                        onChange={e => setDnJustification(e.target.value)}
+                        placeholder={autoJustificationText}
+                        className="w-full text-xs px-3 py-2 border border-orange-200 rounded-lg bg-white focus:outline-none focus:border-orange-400 resize-none text-gray-700 placeholder-orange-300"
+                      />
+                      <p className="text-[10px] text-orange-400 mt-1">
+                        Auto-populated. Edit to add context before committing.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Footer actions */}
+            <div className="p-5 border-t border-gray-100 flex gap-3 shrink-0">
+              <button
+                onClick={() => { setDetailedGRNMode(null); setDnJustification(''); setError(null) }}
+                className="px-4 py-2 rounded-lg border border-gray-200 text-sm text-gray-600 hover:bg-gray-50 transition"
+              >
+                Discard
+              </button>
+              <button
+                onClick={handleLogGRN}
+                disabled={savingGRN}
+                className={`flex-1 px-4 py-2 rounded-lg text-white text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed transition ${shortageItems.length > 0 ? 'bg-red-600 hover:bg-red-700' : 'bg-indigo-600 hover:bg-indigo-700'}`}
+              >
+                {savingGRN
+                  ? 'Saving…'
+                  : shortageItems.length > 0
+                    ? 'Log GRN & Create Debit Note'
+                    : 'Log GRN'}
+              </button>
+            </div>
+          </div>
+
+          {/* ── Right: Challan document viewer ── */}
+          <div className="w-1/2 bg-gray-800 flex flex-col">
+            <div className="px-4 py-2.5 bg-gray-900 text-xs text-gray-400 font-medium border-b border-gray-700 shrink-0 flex items-center justify-between">
+              <span>Supplier Delivery Challan — Original Document</span>
+              {detailedGRNMode.challanNo && (
+                <span className="font-mono text-gray-500">#{detailedGRNMode.challanNo}</span>
+              )}
+            </div>
+            {detailedGRNMode.documentUrl ? (
+              <iframe
+                src={detailedGRNMode.documentUrl}
+                className="flex-1 w-full border-0"
+                title="Supplier delivery challan"
+              />
+            ) : (
+              <div className="flex-1 flex items-center justify-center text-gray-500 text-sm">
+                No document preview available
+              </div>
+            )}
+          </div>
+        </div>
       )}
     </div>
   )

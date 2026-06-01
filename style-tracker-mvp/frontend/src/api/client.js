@@ -82,8 +82,14 @@ export const verifyGRN = (styleNumber, supplierId, poId, grnId, payload) =>
     payload,
   ).then(r => r.data)
 
-export const createGRN = (styleNumber, supplierId, poId, payload) =>
-  api.post(`/cases/${encodeURIComponent(styleNumber)}/suppliers/${supplierId}/pos/${poId}/grns`, payload).then(r => r.data)
+export const ingestDetailedGRN = (styleNumber, supplierId, poId, file) => {
+  const form = new FormData()
+  form.append('file', file)
+  return api.post(
+    `/cases/${encodeURIComponent(styleNumber)}/suppliers/${supplierId}/pos/${poId}/grns`,
+    form,
+  ).then(r => r.data)
+}
 
 // ── Invoices ───────────────────────────────────────────────────────────────
 

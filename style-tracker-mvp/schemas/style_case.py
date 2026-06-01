@@ -49,6 +49,7 @@ class BuyerPOListItem(BaseModel):
     total_order_quantity: int | None
     lifecycle_status: LifecycleStatus
     verification_status: VerificationStatus
+    metadata_: dict[str, Any] = {}
 
 
 class StyleFinancials(BaseModel):

@@ -21,9 +21,11 @@ Required top-level keys (include whatever is present; use null for absent fields
 {
   "style_number": null,
   "buyer_name": null,
+  "sub_buyer_name": null,
   "supplier_name": null,
   "po_number": null,
   "invoice_number": null,
+  "size_breakdown": {},
   "total_quantity": null,
   "total_value": null,
   "agreed_rate": null,
@@ -38,7 +40,11 @@ Required top-level keys (include whatever is present; use null for absent fields
   "extra_fields": {}
 }
 
-Put any field not listed above into "extra_fields".
+Rules:
+- "sub_buyer_name": Optional. Extract a third-party brand name, buying agent, or middleman if printed on the document and distinct from the primary buyer. Use null if not found.
+- "size_breakdown": A JSON object mapping size tokens to their integer quantities, e.g. {"XS": 50, "S": 150, "M": 300, "L": 150, "XL": 100}. Extract every row from any quantity breakdown table, size grid, or colour-size matrix on the document. Aggregate across colours if necessary — keys must be size tokens only. Use an empty object {} if no size breakdown is present.
+- "total_quantity": The absolute total order quantity as an integer. If "size_breakdown" is populated, this MUST equal the mathematical sum of all values in that dictionary. Otherwise extract whatever total quantity is printed.
+- Put any field not listed above into "extra_fields".
 """
 
 SUPPLIER_PO_PARSE_PROMPT = """You are a document parser for a garment manufacturing procurement system.
@@ -162,14 +168,14 @@ Required top-level keys (use null for absent fields):
   "challan_no": null,
   "challan_date": null,
   "vehicle_no": null,
-  "supplier_name": null,
+  "party_name": null,
   "grn_number": null,
   "received_date": null,
   "line_items": [
     {
       "item_name": null,
-      "incoming_qty": null,
-      "uom": null
+      "expected_challan_qty": null,
+      "unit": null
     }
   ],
   "extra_fields": {}
@@ -177,9 +183,10 @@ Required top-level keys (use null for absent fields):
 
 Rules:
 - "line_items" MUST be a JSON array. If there is only one item, still return it as a single-element array.
-- "incoming_qty" must be a number (not a string). Extract the received/delivered quantity per row.
-- "uom" (unit of measurement) should be one of: CONE, BOX, GRS, PCS, MTR, KG, SET, ROLL — or whatever unit is printed.
+- "expected_challan_qty" must be a number (not a string). Extract the quantity the supplier claims to have delivered per row.
+- "unit" (unit of measurement) should be one of: CONE, BOX, GRS, PCS, MTR, KG, SET, ROLL — or whatever unit is printed.
 - "challan_no" is the delivery challan number or document reference number.
+- "party_name" is the supplier or seller name printed on the challan.
 - "grn_number" is the internal GRN reference if printed; otherwise null.
 - "received_date" and "challan_date" must be ISO date strings (YYYY-MM-DD) if extractable, otherwise null.
 - Put any field not listed above into "extra_fields".
