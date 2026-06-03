@@ -1,19 +1,36 @@
 import { useRef, useState } from 'react'
 
+const ALLOWED_MIME = new Set([
+  'application/pdf',
+  'image/jpeg',
+  'image/png',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+])
+const ALLOWED_EXT = /\.(pdf|png|jpe?g|xlsx?)$/i
+
+function isAllowed(f) {
+  return ALLOWED_MIME.has(f.type) || ALLOWED_EXT.test(f.name)
+}
+
 export default function UploadModal({ title, description, onUpload, onClose, loading }) {
   const inputRef = useRef(null)
   const [dragging, setDragging] = useState(false)
   const [file, setFile] = useState(null)
+  const [typeError, setTypeError] = useState(false)
 
   const handleFile = (f) => {
-    if (f) setFile(f)
+    if (!f) return
+    if (!isAllowed(f)) { setTypeError(true); return }
+    setTypeError(false)
+    setFile(f)
   }
 
   const handleDrop = (e) => {
     e.preventDefault()
     setDragging(false)
     const f = e.dataTransfer.files[0]
-    if (f) setFile(f)
+    handleFile(f)
   }
 
   const handleSubmit = () => {
@@ -47,7 +64,7 @@ export default function UploadModal({ title, description, onUpload, onClose, loa
           />
           {file ? (
             <div className="space-y-1">
-              <div className="text-2xl">📄</div>
+              <div className="text-2xl">{file.type.startsWith('image/') ? '🖼' : '📄'}</div>
               <p className="text-sm font-medium text-gray-800">{file.name}</p>
               <p className="text-xs text-gray-400">{(file.size / 1024).toFixed(1)} KB</p>
             </div>
@@ -57,7 +74,10 @@ export default function UploadModal({ title, description, onUpload, onClose, loa
               <p className="text-sm text-gray-500">
                 Drag &amp; drop or <span className="text-indigo-600 font-medium">browse</span>
               </p>
-              <p className="text-xs text-gray-400">PDF, PNG, JPG, Excel supported</p>
+              <p className="text-xs text-gray-400">PDF, PNG, JPG, Excel — including hardcopy phone photos</p>
+              {typeError && (
+                <p className="text-xs text-red-500 font-medium">Unsupported file type. Please upload a PDF, JPG, PNG, or Excel file.</p>
+              )}
             </div>
           )}
         </div>

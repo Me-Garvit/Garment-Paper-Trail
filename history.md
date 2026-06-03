@@ -24,6 +24,260 @@ The File Map must always reflect the live codebase. A new session or a different
 
 ---
 
+### Session 15 — 2026-06-04
+
+**Status:** 3-screen GRN flow implemented — Challan Confirm, GRN Entry, Debit Note — as separate navigable pages. Split-screen wizard from Sessions 13/14 removed. Backend challan-confirm mode added.
+
+**What was done:**
+
+1. **`services/openrouter_ai.py` — `GRN_PARSE_PROMPT` restored to full extraction:**
+   - Re-added `line_items[]` (`item_name`, `qty_value`, `qty_unit`) back to the prompt. Session 14 had stripped these; restored because Screen 1 (Challan Confirm) displays AI-extracted items for the operator to verify.
+   - Retained `success: true/false` legibility check and messy-data fallback (`{"success": false, "reason": "...", "line_items": []}`).
+
+2. **`api/supplier_rooms.py` — `ingest_detailed_grn` (POST /grns):**
+   - Restored line-item normalisation loop from Session 13. AI-extracted items stored in `metadata_.line_items` as `{item_name, qty_unit, qty_value, challan_rate: null, po_rate, actual_received_qty: null, variance: null}`.
+
+3. **`api/supplier_rooms.py` — `verify_grn` (PATCH) — Challan-confirm mode added:**
+   - Before running the reconciliation engine, checks `is_full_verify = any(item.actual_received_qty is not None for item in payload.line_items)`.
+   - If `is_full_verify = False` (Screen 1 submitting challan data only): saves normalised items, sets `verification_status = "CHALLAN_CONFIRMED"`, `is_draft = True`, returns immediately. No reconciliation.
+   - If `is_full_verify = True` (Screen 2 submitting gate counts): runs full contract reconciliation (rate ceiling + qty discrepancy + historical cumulative), sets `verification_status = "VERIFIED"`.
+   - This single PATCH endpoint handles both screens via payload content.
+
+4. **`frontend/src/pages/SupplierRoom.jsx` — split-screen removed, navigates to routes:**
+   - Removed all `detailedGRNMode` state, phase wizard, split-screen JSX, and ~200 lines of helper code.
+   - `handleChallanUpload`: calls `ingestDetailedGRN()` then `navigate(…/challan)` — Screen 1 opened as a full page.
+   - GRN list edit icon uses `grnDestination()` helper to route based on GRN status:
+     - No `file_mime` → old-style GRN → `/verify` (legacy VerifyGRN page)
+     - `PENDING_VERIFICATION` → `/challan`
+     - `CHALLAN_CONFIRMED` → `/grn-entry`
+     - `VERIFIED` + discrepancy → `/debit-note`
+     - `VERIFIED` + no discrepancy → `/grn-entry` (read-only view)
+   - GRN list now shows a status badge per row: `VERIFIED` (green), `CHALLAN CONFIRMED` (blue), `PENDING` (orange).
+
+5. **`frontend/src/pages/VerifyGRN.jsx` — repurposed as Screen 1 (Challan Confirm):**
+   - Route: `/grns/:grnId/challan`. Breadcrumb shows "Step 1 of 3".
+   - Fetches GRN + SupplierPO in parallel. PO line items populate a "Match to PO item" dropdown per row (auto-fills `item_name`, `qty_unit`, `po_rate`).
+   - Parse-failed banner if `metadata_.parse_failed === true`.
+   - Right panel: `<img>` for image MIME types, `<iframe>` for PDFs (uses `metadata_.file_mime`).
+   - Line items table: PO dropdown + item name input + challan qty + unit dropdown + challan rate input.
+   - "Confirm Challan →" → PATCH /verify (no `actual_received_qty`) → navigate to `/grn-entry`.
+   - Also still handles legacy `/verify` route for old-style GRNs.
+
+6. **New `frontend/src/pages/GRNEntry.jsx` — Screen 2 (Actual Gate Count):**
+   - Route: `/grns/:grnId/grn-entry`.
+   - Fetches GRN. Shows confirmed challan items locked (read-only). Actual received qty input per row.
+   - Defaults `actual_received_qty = qty_value` so operator only edits shortage rows.
+   - Live variance column per row; totals footer.
+   - Gatekeeper justification textarea (only shown if any shortage/rate discrepancy detected).
+   - "Log GRN & View Debit Note →" (red, if discrepancy) → PATCH /verify (with `actual_received_qty`) → navigate to `/debit-note`.
+   - "Confirm & Log GRN" (indigo, if clean) → PATCH /verify → navigate back to Supplier Room.
+
+7. **New `frontend/src/pages/DebitNote.jsx` — Screen 3 (DN Window):**
+   - Route: `/grns/:grnId/debit-note`.
+   - Fetches GRN. Full-page (no split-screen). Displays:
+     - DN header card with party name, challan ref, grand total.
+     - Comparison table: all line items with Challan Qty / Received Qty / Variance / Flags (SHORT, RATE↑).
+     - Shortage Penalty section: per-item `shortage_qty × po_rate = penalty`.
+     - Rate Inflation Overcharge section: per-item `challan_rate vs po_rate × qty = overcharge`.
+     - Justification / Gatekeeper Note.
+     - Grand total card.
+   - "Acknowledge & Return to Supplier Room" → navigate to Supplier Room.
+
+8. **`frontend/src/App.jsx` — new routes added:**
+   - `/grns/:grnId/challan` → VerifyGRN (Screen 1)
+   - `/grns/:grnId/grn-entry` → GRNEntry (Screen 2)
+   - `/grns/:grnId/debit-note` → DebitNote (Screen 3)
+   - `/grns/:grnId/verify` retained → VerifyGRN (legacy backward compat)
+
+**New files:**
+- `style-tracker-mvp/frontend/src/pages/GRNEntry.jsx` — Screen 2: actual gate count entry
+- `style-tracker-mvp/frontend/src/pages/DebitNote.jsx` — Screen 3: debit note comparison window
+
+**Changed files (no DB migrations):**
+- `style-tracker-mvp/services/openrouter_ai.py` — GRN_PARSE_PROMPT: line items restored
+- `style-tracker-mvp/api/supplier_rooms.py` — `ingest_detailed_grn`: line items restored; `verify_grn`: challan-confirm mode added
+- `style-tracker-mvp/frontend/src/pages/SupplierRoom.jsx` — split-screen removed, challan upload navigates to `/challan`, status-aware GRN edit routing
+- `style-tracker-mvp/frontend/src/pages/VerifyGRN.jsx` — full rewrite as Screen 1 with PO dropdown, parse-failed banner, image/PDF detection
+- `style-tracker-mvp/frontend/src/App.jsx` — 3 new GRN routes added
+
+**Next Steps (pick up here in Session 16):**
+1. End-to-end test: upload challan → Screen 1 opens, AI items visible → confirm → Screen 2 opens with items locked → lower one gate count → Log GRN → Screen 3 shows comparison.
+2. Test parse-failed path: upload blurry photo → Screen 1 shows red banner → manually enter items from PO dropdown → confirm.
+3. Verify CHALLAN_CONFIRMED status badge shows in GRN list after Step 1.
+4. Verify edit icon routes correctly: CHALLAN_CONFIRMED → /grn-entry, VERIFIED+discrepancy → /debit-note.
+5. Test clean GRN (no shortage): Step 2 routes directly back to Supplier Room.
+
+---
+
+### Session 14 — 2026-06-04
+
+**Status:** Two-phase GRN entry wizard, dynamic PO dropdown matching, and contract reconciliation engine implemented. GRN parse prompt stripped to header-only. Rate ceiling enforcement and fallback pricing math added.
+
+**What was done:**
+
+1. **`services/openrouter_ai.py` — `GRN_PARSE_PROMPT` stripped to header-only:**
+   - Removed all `line_items` extraction from the GRN prompt. Line items are now logged manually through the frontend PO dropdown — AI no longer attempts row extraction.
+   - Retained the legibility check (`success: false` for messy/blurry documents) and the 6 header fields: `challan_no`, `challan_date`, `vehicle_no`, `party_name`, `grn_number`, `received_date`.
+   - Added explicit note: "Do NOT extract line items — those are logged manually against the linked Supplier PO items."
+
+2. **`api/supplier_rooms.py` — `ingest_detailed_grn` (POST /grns) simplified:**
+   - Removed all line-item normalisation loop (no more `qty_value`/`qty_unit` building at ingest time).
+   - Now stores `line_items: []` (empty) in JSONB — the two-phase PATCH/verify step populates items.
+   - Kept MIME normalisation, Supabase upload, AI header parse, `parse_failed`/`parse_error_reason`, `file_mime` in metadata.
+
+3. **`api/supplier_rooms.py` — `verify_grn` (PATCH) — Contract Reconciliation Engine:**
+   - Added `func` to `from sqlalchemy import func, select`.
+   - **Historical cumulative query:** uses `func.coalesce(func.sum(GRN.received_quantity), 0.0)` to get the total received from all OTHER GRNs for the same `supplier_po_id`. Stored in JSONB as `historical_cumulative_qty` and `cumulative_after_grn`.
+   - **Rate ceiling check:** per item, reads `challan_rate` (from payload) and `po_rate` (from payload). If `po_rate > 0 && challan_rate > po_rate` → `is_rate_discrepancy: True`. Computes `rate_excess` and `overcharge_amount = challan_qty × (challan_rate − po_rate)`.
+   - **Qty discrepancy check:** `variance = actual − challan_qty`. If negative → `is_qty_discrepancy: True`. Computes `shortage_qty = abs(variance)` and `penalty_amount = shortage_qty × (po_rate or challan_rate)`.
+   - **`debit_note_draft`** now contains two separate arrays: `shortage_items[]` and `rate_inflated_items[]`, plus `total_penalty_amount`, `total_overcharge_amount`.
+   - `is_discrepancy` is true if EITHER rate or qty discrepancy is present.
+   - Backward compat: still reads `item.get("qty_value") or item.get("expected_challan_qty") or item.get("incoming_qty")` for legacy GRNs.
+
+4. **`frontend/src/pages/SupplierRoom.jsx` — Two-Phase Entry Wizard:**
+   - **Phase lock mechanism:** `detailedGRNMode.phase` (1 or 2). Users cannot reach Phase 2 without completing Phase 1 validation (≥1 row with non-empty item name and `qty_value > 0`).
+   - **Dynamic PO dropdown matching:** `poLineItems = selectedPO?.metadata_?.line_items || []`. Each Phase 1 row has a `<select>` populated from the master PO. Selecting an item auto-fills `item_name`, `qty_unit`, and `po_rate`. An "— Other —" option enables free-text manual entry.
+   - **Phase 1 (Challan Log):** 5-column grid — Item selector, Challan Qty, Challan Rate ₹/unit, Line Value ₹, Rate Status. "+ Add Item Row" button. Row ✕ remove button. Totals footer.
+   - **Fallback Pricing Math:** `effectiveChallanRate(row)` = if `line_value > 0 && qty_value > 0`: `line_value / qty_value`; else `challan_rate`. This allows the operator to enter total line value instead of unit rate; rate is derived dynamically. When `line_value` is entered with a qty, the computed rate is shown as a small sub-label.
+   - **`[RATE_INFLATED]` badge:** appears inline on Phase 1 row when `effectiveChallanRate > po_rate`. Does not block progress.
+   - **Phase transition:** "Next: Log Physical Counts →" advances; `advanceToPhase2()` defaults `actual_received_qty = qty_value` so operator only corrects shortages. "← Back" returns to Phase 1 without data loss.
+   - **Phase 2 (Gate Count):** Phase 1 columns become read-only. 5-column grid — Item, Challan Qty (locked), Rate (locked + `INFLATED` badge), Actual Count (input), Variance (computed). Footer row shows total challan vs actual. Separate cumulative row: `existingGRNTotal + totalActualQty` vs `selectedPO.ordered_quantity`; `OVER BUDGET` badge if exceeded.
+   - **Debit Note Draft Summary card:** auto-appears in Phase 2 when any shortage OR rate inflation exists. Two sections: "Qty Shortages" (per-item shortage × PO rate = penalty) and "Rate Inflations" (per-item excess rate × challan qty = overcharge). Separate subtotals. Gatekeeper comments textarea with auto-generated placeholder.
+   - **`handleLogGRN`:** compiles `{ po_item_idx, item_name, qty_unit, po_rate, qty_value, challan_rate (derived), actual_received_qty }` per row and PATCH /verify. Sends `challan_date`, `vehicle_no`, `supplier_name` in payload.
+   - **Commit button:** "Confirm & Log GRN + Debit Note" (red) when discrepancies exist; "Confirm & Log GRN" (indigo) when clean.
+   - **Right panel:** unchanged from Session 13 (`<img>` for images, `<iframe>` for PDFs, detected by `fileMime`).
+   - **Helper functions** at module top: `poItemUnit`, `poItemRate`, `poItemName`, `effectiveChallanRate`, `isRateInflated`, `itemVariance`, `emptyRow`.
+
+**Changed files (no new files, no migrations):**
+- `style-tracker-mvp/services/openrouter_ai.py` — GRN_PARSE_PROMPT stripped to header-only; line_items removed from AI scope
+- `style-tracker-mvp/api/supplier_rooms.py` — `ingest_detailed_grn`: line-item loop removed; `verify_grn`: added `func` import, historical cumulative query, rate ceiling + qty discrepancy reconciliation, dual `debit_note_draft` structure
+- `style-tracker-mvp/frontend/src/pages/SupplierRoom.jsx` — complete two-phase wizard: PO dropdown, Phase 1 challan log, fallback pricing math, phase lock, Phase 2 gate count, cumulative budget tracker, rate inflation + shortage debit note card
+
+**No API contract changes. No table migrations. All 4-vector tracking (challan, gate count, rate, cumulative) stored in `grns.metadata_` JSONB.**
+
+**Next Steps (pick up here in Session 15):**
+1. End-to-end: upload challan photo → Phase 1: pick items from PO dropdown, enter qty + rate → advance → Phase 2: lower one gate count → confirm debit note card appears with both shortage and rate sections.
+2. Verify `challan_rate > po_rate` triggers `[RATE_INFLATED]` badge inline in Phase 1.
+3. Verify `rate_inflated_items` and `shortage_items` both appear in `grns.metadata_.debit_note_draft` after commit.
+4. Test `cumulative_after_grn` stored in JSONB matches `historical_qty + actual_total`.
+5. Test "— Other —" dropdown option for items not in PO (manual item name entry).
+
+---
+
+### Session 13 — 2026-06-03
+
+**Status:** Advanced 3-stream GRN subsystem upgraded — image upload support, messy-data parse fallback, `qty_value`/`qty_unit` UOM segregation, editable header fields, and manual-entry override gate added.
+
+**What was done:**
+
+1. **`services/openrouter_ai.py` — `GRN_PARSE_PROMPT` refactored:**
+   - Added `"success": true` top-level key to the expected JSON output shape.
+   - Renamed line-item field `expected_challan_qty` → `qty_value` (number) and `unit` → `qty_unit` (string), matching the `qty_value`/`qty_unit` convention already used in Supplier PO and Invoice line items (established Session 11).
+   - Added a CRITICAL LEGIBILITY CHECK instruction at the top of the prompt: if the document is a phone photograph of a handwritten challan, ink-stamped form, or any illegible/overlapping/blurry document, the model must immediately return `{"success": false, "reason": "data is too messy to read", "line_items": []}` and not attempt to guess values.
+   - `_call_deepseek` updated: when `mime_type` starts with `image/`, DeepSeek (text-only model) now returns the structured fallback `{"success": False, "reason": "image content requires a vision model; DeepSeek cannot process it", "line_items": []}` directly instead of crashing or returning a garbled response.
+
+2. **`api/supplier_rooms.py` — `ingest_detailed_grn` (POST /grns):**
+   - Added image MIME type normalisation: if `content_type` is not `application/pdf`/`image/jpeg`/`image/png`, the filename extension (`.jpg`, `.jpeg`, `.png`) is used as a fallback to set the correct MIME before calling the AI service.
+   - Added `parse_failed = not parsed.get("success", True)` check. When `True` (messy data or DeepSeek image fallback): `raw_items = []`, and `parse_failed: True` + `parse_error_reason` are stored in the JSONB `metadata_` column — no table migration needed.
+   - Line items now stored with `qty_value` and `qty_unit` keys (previously `expected_challan_qty` and `unit`). Backward compat fallbacks (`item.get("qty_value") or item.get("expected_challan_qty") or item.get("incoming_qty")`) ensure old GRN records continue to work.
+   - `file_mime` stored in `metadata_` so the frontend can render `<img>` vs `<iframe>` correctly.
+
+3. **`api/supplier_rooms.py` — `verify_grn` (PATCH .../verify):**
+   - `expected` now reads `item.get("qty_value") or item.get("expected_challan_qty") or item.get("incoming_qty") or 0` — supports both new and legacy GRN records.
+   - `unit` now reads `item.get("qty_unit") or item.get("unit") or item.get("uom")`.
+   - `shortage_items` built with `qty_unit` and `qty_value` keys.
+   - `item_summary` in auto-justification string uses `s.get('qty_unit', s.get('unit', ''))` for backward compat.
+   - `received_quantity` sum uses `actual_received_qty or qty_value or expected_challan_qty or incoming_qty` fallback chain.
+
+4. **`components/UploadModal.jsx` — file type validation added:**
+   - Added `ALLOWED_MIME` set and `ALLOWED_EXT` regex constants.
+   - `handleFile` and `handleDrop` now call `isAllowed(f)` before accepting a file. Unsupported types show a red inline error message.
+   - Drop zone description updated to "PDF, PNG, JPG, Excel — including hardcopy phone photos".
+   - File icon: shows 🖼 for images, 📄 for documents.
+
+5. **`frontend/src/pages/SupplierRoom.jsx` — split-screen GRN layout fully refactored:**
+   - **Button renamed:** "+ Ingest Detailed GRN" → "+ Ingest Gate Challan".
+   - **`detailedGRNMode` shape extended:** added `fileMime` (for image vs PDF render), `vehicleNo`, `parseFailed` fields. Line items use `qty_value`/`qty_unit` instead of `expected_challan_qty`/`unit`.
+   - **Messy-data banner:** if `parseFailed === true`, a high-visibility red bordered banner appears at the top of the left panel: "Data is too messy to read, fill details manually".
+   - **Editable header fields:** Challan No and Vehicle No are now editable `<input>` fields in the left panel (previously displayed as static subtitle text).
+   - **Row-level editing:** item name is now an always-editable inline input. `qty_value` (challan expected qty) is an editable number input (critical for manual mode). `qty_unit` is a `<select>` dropdown populated from `UOM_OPTIONS = ['CONE', 'BOX', 'GRS', 'PCS', 'MTR', 'KG', 'SET', 'ROLL']`.
+   - **Add / Remove rows:** "+ Add Row" button appends an empty item. ✕ button on each row removes it. Both work in auto (AI-populated) and manual modes.
+   - **Right panel image rendering:** detects `fileMime.startsWith('image/')` and renders `<img>` (with `object-contain`) for phone photos; falls back to `<iframe>` for PDFs.
+   - **`itemVariance`** updated to compute `gate - item.qty_value` (was `item.expected_challan_qty`).
+   - **Debit Note Summary card:** updated to use `item.qty_value` and `item.qty_unit` throughout.
+   - **Commit button:** renamed "Log GRN & Create Debit Note" → "Log GRN & Commit Debit Note".
+   - **`handleLogGRN`:** now sends `qty_value`, `qty_unit` in line items (was `expected_challan_qty`, `unit`). Also sends `vehicle_no` from `detailedGRNMode.vehicleNo`.
+
+**Changed files (no new files, no migrations):**
+- `style-tracker-mvp/services/openrouter_ai.py` — GRN_PARSE_PROMPT (qty_value/qty_unit, success flag, messy-data fallback); `_call_deepseek` image guard
+- `style-tracker-mvp/api/supplier_rooms.py` — `ingest_detailed_grn`: image MIME normalisation, parse_failed handling, qty_value/qty_unit; `verify_grn`: backward-compat field reads
+- `style-tracker-mvp/frontend/src/components/UploadModal.jsx` — explicit MIME/ext validation, image icon, error message
+- `style-tracker-mvp/frontend/src/pages/SupplierRoom.jsx` — full split-screen refactor: parse-failed banner, editable header, image render, add/remove rows, qty_value/qty_unit, "Log GRN & Commit Debit Note"
+
+**No API contract changes. No table migrations. All new fields stored in existing `grns.metadata_` JSONB column.**
+
+**Next Steps (pick up here in Session 14):**
+1. End-to-end test: upload a phone photo of a handwritten challan → confirm red "too messy" banner appears + manual entry grid activates.
+2. Upload a clean printed challan photo (JPG) → confirm `<img>` renders in right panel instead of iframe.
+3. Test manual row entry: add rows from scratch, fill qty_value + actual count → confirm Debit Note card computes correctly.
+4. Confirm `parse_failed: true` is stored in JSONB and does not break the GRN list view.
+5. Test backward compat: open an existing GRN created before Session 13 (has `expected_challan_qty`/`unit`) in the verify page — confirm it still renders correctly.
+
+---
+
+### Session 12 — 2026-06-02
+
+**Status:** Redundant boto3 dependency removed; Agreed Rate field removed from Supplier PO verification, and Ordered Quantity auto-sync added.
+
+**What was done:**
+1. **`requirements.txt`:**
+   - Removed `boto3==1.35.27` as it is no longer used since storage has been refactored to use Supabase REST API via `httpx`.
+2. **`style-tracker-mvp/frontend/src/pages/VerifySupplierPO.jsx`:**
+   - Removed the obsolete "Agreed Rate (₹/unit)" input field from the Supplier PO verification workspace (since rates are item-specific).
+   - Added auto-calculating "Ordered Quantity" derived from the sum of line items' quantities, locking it to read-only when items are present.
+   - Wired `handleConfirm` to submit `agreed_rate: null` and the final quantity to the API.
+3. **`style-tracker-mvp/api/supplier_rooms.py` — `verify_supplier_po` (PATCH):**
+   - Refactored `agreed_rate` and `ordered_quantity` updates to check `model_fields_set` instead of `is not None`. This allows the front-end to explicitly set `agreed_rate` to `null` to clear it in the database.
+
+---
+
+### Session 11 — 2026-06-02
+
+**Status:** Split-screen verification tables refactored across VerifySupplierPO and VerifyInvoice. Unified quantity strings (`664 GRS`) broken into separate, mutable `qty_value` (number input) and `qty_unit` (select dropdown) columns. Live `Value = Qty × Rate` recalculation added. Invoice taxable value auto-syncs from line items total.
+
+**What was done:**
+
+1. **`api/supplier_rooms.py` — `verify_supplier_invoice` (PATCH):**
+   - Changed `invoice.metadata_ = payload.metadata_` (replace) to `invoice.metadata_ = {**invoice.metadata_, **payload.metadata_}` (merge).
+   - Matches the existing behaviour of `verify_supplier_po`, which already merges. Prevents AI-extracted metadata fields not present in the verify payload from being silently wiped on confirm.
+
+2. **`frontend/src/pages/VerifySupplierPO.jsx` — line items table refactored:**
+   - `lineItems` state added. On load: normalises existing AI-extracted items from old format (`quantity`/`uom`) or new format (`qty_value`/`qty_unit`) — both shapes handled.
+   - Static read-only Qty column replaced with two interactive columns: `[Qty]` (number input bound to `qty_value`) and `[Unit]` (`<select>` bound to `qty_unit`, populated from `UOM_OPTIONS`). Unknown units extracted by AI appear as an extra `<option>` to preserve them.
+   - `[Rate]` column is now also an editable number input (was static text).
+   - `[Value]` column is a live read-only computed cell: `Value = qty_value × rate`, recalculated on every `onChange`.
+   - Summary footer row below the table: total qty sum + total ₹ value across all rows.
+   - `handleConfirm` now sends `metadata_: { ...existingMeta, line_items: cleanedItems }` where each item carries `qty_value`, `qty_unit`, `rate`, and the recomputed `taxable_value`.
+
+3. **`frontend/src/pages/VerifyInvoice.jsx` — line items table added + taxable_value auto-sync:**
+   - `lineItems` state added with same normalisation logic as VerifySupplierPO.
+   - Identical editable table rendered when `invoice.metadata_.line_items` is non-empty: `[Qty]` + `[Unit]` + `[Rate]` + `[Value]` columns, same live recalculation.
+   - `Taxable Value (₹)` field: when line items compute a positive total, the field locks read-only and shows the computed sum with an `"auto"` label. Falls back to manual entry when no line items are present or none have valid qty/rate.
+   - `handleConfirm`: `taxable_value` is set to the computed total if available, else form value. Updated `metadata_` with cleaned `line_items` is merged into invoice metadata.
+   - Raw JSON metadata dump removed; replaced with structured key-value cards for scalar extra fields.
+
+**Changed files (no new files, no migrations):**
+- `style-tracker-mvp/api/supplier_rooms.py` — `verify_supplier_invoice`: metadata replace → merge
+- `style-tracker-mvp/frontend/src/pages/VerifySupplierPO.jsx` — editable qty_value/qty_unit/rate columns, live value, footer, metadata on confirm
+- `style-tracker-mvp/frontend/src/pages/VerifyInvoice.jsx` — line items table added, taxable_value auto-sync, raw JSON dump removed
+
+**Next Steps (pick up here in Session 12):**
+1. Test VerifySupplierPO with a real PO — confirm qty/unit/rate columns populate and Value column recomputes on edit.
+2. Test VerifyInvoice — confirm taxable_value locks to computed total when line items are present.
+3. Confirm PATCH /verify stores `qty_value`/`qty_unit` inside JSONB and doesn't corrupt old `quantity`/`uom` records.
+
+---
+
 ### Session 10 — 2026-06-01
 
 **Status:** Sub-buyer tracking and dynamic size-wise quantity breakdown added to the Buyer PO inception workflow. No schema migrations; all new fields stored in existing `metadata_` JSONB.
@@ -550,11 +804,11 @@ All code lives under `style-tracker-mvp/`. Paths below are relative to that root
 - **Edit here when:** changing bucket, folder structure, presigned URL expiry, or adding multi-file support.
 
 #### `services/openrouter_ai.py`
-- `_call_openrouter(file_bytes, mime_type, prompt)` → sends base64 image_url message to OpenRouter with the given prompt (default: `DOCUMENT_PARSE_PROMPT`).
-- `_call_deepseek(file_bytes, mime_type, prompt)` → extracts PDF text via `pypdf.PdfReader`, sends text-only message to `api.deepseek.com`. Prompt param allows per-document-type targeting.
+- `_call_openrouter(file_bytes, mime_type, prompt)` → sends base64 image_url message to OpenRouter. Supports PDF and image/* MIME types.
+- `_call_deepseek(file_bytes, mime_type, prompt)` → extracts PDF text via `pypdf.PdfReader`. For `image/*` MIME types, returns structured failure dict directly (DeepSeek is text-only).
 - `parse_document(file_bytes, mime_type)` → general document parser (buyer POs, invoices). OpenRouter → DeepSeek.
 - `parse_supplier_po(file_bytes, mime_type)` → Supplier PO-specific parser using `SUPPLIER_PO_PARSE_PROMPT`. Extracts: supplier_name, po_number, material_category, hsn_codes[], line_items[], agreed_rate, total_quantity, total_value, payment_terms. OpenRouter → DeepSeek.
-- `parse_grn(file_bytes, mime_type)` → GRN/challan-specific parser using `GRN_PARSE_PROMPT`. Extracts: challan_no, challan_date, vehicle_no, supplier_name, grn_number, line_items[] (item_name, incoming_qty as number, uom). OpenRouter → DeepSeek.
+- `parse_grn(file_bytes, mime_type)` → GRN/challan header-only parser using `GRN_PARSE_PROMPT`. Returns `{"success": true/false, challan_no, challan_date, vehicle_no, party_name, grn_number, received_date}`. NO line_items — those are logged via frontend PO dropdown. On illegible/messy documents returns `{"success": false, "reason": "data is too messy to read"}`. OpenRouter → DeepSeek.
 - **Edit here when:** changing models, adding a new document type prompt, or changing the fallback chain.
 
 #### `services/matching_engine.py`
@@ -587,8 +841,8 @@ All code lives under `style-tracker-mvp/`. Paths below are relative to that root
   - `POST /{supplier_id}/pos/{po_id}/grns/upload` → `upload_grn` — UploadFile, calls `parse_grn()`, writes line_items[] atomically to JSONB, computes received_quantity = Σ(incoming_qty)
   - `GET /{supplier_id}/pos/{po_id}/grns` → `list_grns`
   - `GET /{supplier_id}/pos/{po_id}/grns/{grn_id}` → `get_grn` — returns single GRN with `document_url`
-  - `PATCH /{supplier_id}/pos/{po_id}/grns/{grn_id}/verify` → `verify_grn` — updates header + line_items in JSONB, recomputes received_quantity, marks VERIFIED
-  - `POST /{supplier_id}/pos/{po_id}/grns` → `create_grn` — manual JSON body (retained)
+  - `PATCH /{supplier_id}/pos/{po_id}/grns/{grn_id}/verify` → `verify_grn` — Contract Reconciliation Engine. Queries historical cumulative GRN qty for the PO (excluding current). Per item: rate ceiling check (`challan_rate > po_rate` → `is_rate_discrepancy`), qty discrepancy check (`variance < 0` → `is_qty_discrepancy`), computes `penalty_amount` and `overcharge_amount`. Builds `debit_note_draft` with `shortage_items[]` and `rate_inflated_items[]`. Stores `historical_cumulative_qty` + `cumulative_after_grn` in JSONB. Backward compat: reads `qty_value or expected_challan_qty or incoming_qty`.
+  - `POST /{supplier_id}/pos/{po_id}/grns` → `ingest_detailed_grn` — accepts PDF or image (JPG/PNG), normalises MIME type from filename if needed, runs `parse_grn()` (header only — no line items), stores `parse_failed`/`parse_error_reason`/`file_mime` in JSONB `metadata_`. `line_items: []` (empty — populated by PATCH /verify two-phase payload).
   - `POST /{supplier_id}/invoices/upload` → `upload_supplier_invoice`
   - `PATCH /{supplier_id}/invoices/{invoice_id}/verify` → `verify_supplier_invoice` — triggers `run_three_way_match`
   - `GET /{supplier_id}/invoices` → `list_invoices`
@@ -638,11 +892,11 @@ All frontend code lives under `frontend/src/`. Dev server: `localhost:5173`. API
 
 #### `pages/SupplierRoom.jsx`
 - 5-column grid layout: left 2 cols = PO list; right 3 cols = GRN table + invoice table.
-- "+ Upload PO" button → `UploadModal` → `uploadSupplierPO()` → navigates to `VerifySupplierPO`. Eye + edit icons on each PO row.
-- Selecting a PO shows its GRNs with a running total row. "+ Upload GRN" button → `UploadModal` → `uploadGRN()` → navigates to `VerifyGRN`. Edit icon on each GRN row.
-- "Upload Supplier Bill" → `uploadInvoice()` → navigates to `VerifyInvoice`. Eye icon on each invoice row opens `DocumentPanel`.
-- Contains `DocumentPanel` for PDF side-panel viewing of POs and invoices.
-- **Edit here when:** adding PO editing, GRN flow changes, invoice deletion, or showing cumulative match status per PO.
+- "+ Upload PO" → `UploadModal` → `uploadSupplierPO()` → navigates to `VerifySupplierPO`.
+- Selecting a PO shows GRNs. GRN list shows per-row status badge: `VERIFIED` (green), `CHALLAN CONFIRMED` (blue), `PENDING` (orange).
+- "+ Ingest Gate Challan" → `UploadModal` (PDF or image) → `ingestDetailedGRN()` → **navigate to `/challan`** (Screen 1, separate page — no split-screen).
+- GRN edit icon uses `grnDestination()` to route by status: no `file_mime` → `/verify` (legacy), `PENDING_VERIFICATION` → `/challan`, `CHALLAN_CONFIRMED` → `/grn-entry`, `VERIFIED+discrepancy` → `/debit-note`, `VERIFIED` → `/grn-entry`.
+- **Edit here when:** changing GRN status routing logic, adding invoice deletion, or modifying the PO list display.
 
 #### `pages/VerifySupplierPO.jsx`
 - Split-screen layout for reviewing AI-extracted Supplier PO data.
@@ -651,13 +905,30 @@ All frontend code lives under `frontend/src/`. Dev server: `localhost:5173`. API
 - "Confirm & Save" calls `verifySupplierPO()` → marks `is_draft=False`, `verification_status=VERIFIED` in JSONB → navigates to SupplierRoom.
 - **Edit here when:** adding more PO fields, changing line item display, or updating the confirm flow.
 
-#### `pages/VerifyGRN.jsx`
-- Split-screen GRN verify page.
-- Left: 2-column header form (GRN#, challan#, challan date, vehicle no, supplier name) + editable line-items grid (item name / incoming qty / UOM dropdown / delete row) + live total qty row + "+ Add Row" button.
-- Right: `<iframe>` via `document_url` presigned URL from `get_grn`.
-- "Confirm & Save GRN" (draft) / "Update GRN" (already verified) — mode-aware button label.
-- On confirm: calls `verifyGRN()` → `PATCH .../verify`, then navigates back to SupplierRoom.
-- **Edit here when:** adding more GRN header fields, changing UOM options, or adding batch-GRN support.
+#### `pages/VerifyGRN.jsx` — Screen 1 of 3: Challan Confirm
+- Route: `/grns/:grnId/challan` (and legacy `/grns/:grnId/verify`). Breadcrumb: "Step 1 of 3".
+- Fetches GRN + SupplierPO in parallel. PO line items populate a "Match to PO item" dropdown per row that auto-fills `item_name`, `qty_unit`, `po_rate`.
+- Parse-failed banner if `metadata_.parse_failed === true`.
+- Right panel: `<img>` for image MIME types, `<iframe>` for PDFs (from `metadata_.file_mime`).
+- Left: header form (GRN#, challan#, challan date, vehicle no, party name) + line items (PO dropdown + item name + challan qty + unit + challan rate).
+- "Confirm Challan →" → PATCH /verify (no `actual_received_qty`) → navigate to `/grn-entry`.
+- **Edit here when:** adding more challan header fields, changing item matching logic.
+
+#### `pages/GRNEntry.jsx` — Screen 2 of 3: Actual Gate Count (NEW)
+- Route: `/grns/:grnId/grn-entry`.
+- Fetches GRN. Shows confirmed challan items locked (read-only). Actual received qty input per row.
+- Defaults `actual_received_qty = qty_value`. Live variance column + totals footer.
+- Gatekeeper justification textarea (shown only when discrepancy detected).
+- "Log GRN & View Debit Note →" (if discrepancy) → PATCH /verify → navigate to `/debit-note`.
+- "Confirm & Log GRN" (if clean) → PATCH /verify → navigate to Supplier Room.
+- **Edit here when:** adding more gate count fields or changing the discrepancy routing logic.
+
+#### `pages/DebitNote.jsx` — Screen 3 of 3: Debit Note Window (NEW)
+- Route: `/grns/:grnId/debit-note`.
+- Full-page (no split-screen). Fetches GRN, reads `metadata_.debit_note_draft`.
+- Sections: DN header card (party, challan ref, grand total), comparison table (challan vs GRN vs variance vs flags), Shortage Penalty section, Rate Inflation Overcharge section, Justification, Grand Total card.
+- "Acknowledge & Return to Supplier Room" → navigate to Supplier Room.
+- **Edit here when:** changing debit note display format or adding acknowledgement tracking.
 
 #### `pages/VerifyInvoice.jsx`
 - Split-screen layout. Left: invoice form with fields for invoice number, linked PO (dropdown from `listSupplierPOs`), invoice rate, qty, taxable value. Right: `<iframe>` of invoice file.
@@ -682,8 +953,10 @@ All frontend code lives under `frontend/src/`. Dev server: `localhost:5173`. API
 - **Edit here when:** changing panel width, adding zoom controls, or adding a download button.
 
 #### `components/UploadModal.jsx`
-- Drag-and-drop file upload modal. Accepts PDF, PNG, JPG, Excel.
+- Drag-and-drop file upload modal. Accepts PDF, PNG, JPG (hardcopy phone photos), Excel.
 - Props: `title`, `description`, `onUpload(file)`, `onClose`, `loading`.
+- `isAllowed(f)` validates against `ALLOWED_MIME` set and `ALLOWED_EXT` regex; shows inline red error for unsupported types.
+- File icon: 🖼 for images, 📄 for documents.
 - **Edit here when:** changing accepted file types, adding a progress bar, or adding multi-file support.
 
 #### `index.css`

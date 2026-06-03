@@ -1,7 +1,7 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
@@ -88,24 +88,46 @@ async def create_supplier_po(
     s3_key = await s3_storage.upload_document(file, folder="supplier_pos")
     parsed = await openrouter_ai.parse_supplier_po(content, mime)
 
-    spo = SupplierPO(
-        style_number=style_number,
-        supplier_id=supplier_id,
-        supplier_name=parsed.get("supplier_name") or supplier.name,
-        supplier_po_number=parsed.get("po_number") or f"DRAFT-{uuid.uuid4().hex[:8]}",
-        material_category=_parse_material_category(parsed.get("material_category")),
-        agreed_rate=parsed.get("agreed_rate"),
-        ordered_quantity=parsed.get("total_quantity"),
-        metadata_={
-            **{k: v for k, v in parsed.items() if k not in (
-                "supplier_name", "po_number", "material_category", "agreed_rate", "total_quantity"
-            )},
-            "file_url": s3_key,
-            "is_draft": True,
-            "verification_status": "PENDING_VERIFICATION",
-        },
+    po_number = parsed.get("po_number") or f"DRAFT-{uuid.uuid4().hex[:8]}"
+    meta = {
+        **{k: v for k, v in parsed.items() if k not in (
+            "supplier_name", "po_number", "material_category", "agreed_rate", "total_quantity"
+        )},
+        "file_url": s3_key,
+        "is_draft": True,
+        "verification_status": "PENDING_VERIFICATION",
+    }
+
+    # Upsert: re-uploading the same PO number refreshes the draft instead of crashing
+    existing = await db.execute(
+        select(SupplierPO).where(SupplierPO.supplier_po_number == po_number)
     )
-    db.add(spo)
+    spo = existing.scalar_one_or_none()
+
+    if spo:
+        if not spo.metadata_.get("is_draft", True):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"A verified Supplier PO '{po_number}' already exists.",
+            )
+        spo.supplier_name = parsed.get("supplier_name") or supplier.name
+        spo.material_category = _parse_material_category(parsed.get("material_category"))
+        spo.agreed_rate = parsed.get("agreed_rate")
+        spo.ordered_quantity = parsed.get("total_quantity")
+        spo.metadata_ = meta
+    else:
+        spo = SupplierPO(
+            style_number=style_number,
+            supplier_id=supplier_id,
+            supplier_name=parsed.get("supplier_name") or supplier.name,
+            supplier_po_number=po_number,
+            material_category=_parse_material_category(parsed.get("material_category")),
+            agreed_rate=parsed.get("agreed_rate"),
+            ordered_quantity=parsed.get("total_quantity"),
+            metadata_=meta,
+        )
+        db.add(spo)
+
     await db.flush()
     await db.refresh(spo)
     return spo
@@ -158,9 +180,9 @@ async def verify_supplier_po(
         spo.supplier_po_number = payload.supplier_po_number
     if payload.material_category:
         spo.material_category = payload.material_category
-    if payload.agreed_rate is not None:
+    if "agreed_rate" in payload.model_fields_set:
         spo.agreed_rate = payload.agreed_rate
-    if payload.ordered_quantity is not None:
+    if "ordered_quantity" in payload.model_fields_set:
         spo.ordered_quantity = payload.ordered_quantity
     meta_update = payload.metadata_ or {}
     spo.metadata_ = {**spo.metadata_, **meta_update, "is_draft": False, "verification_status": "VERIFIED"}
@@ -284,73 +306,152 @@ async def verify_grn(
 
     raw_items = payload.line_items if payload.line_items is not None else grn.metadata_.get("line_items", [])
 
-    # 3-stream reconciliation: compute variance and detect shortages per line item
+    # ── Challan-confirm mode (no actual_received_qty in payload) ────────────
+    # Screen 1 sends only challan header + line items without gate counts.
+    # Save them under status=CHALLAN_CONFIRMED and return early.
+    is_full_verify = bool(raw_items) and any(
+        item.get("actual_received_qty") is not None
+        for item in raw_items if isinstance(item, dict)
+    )
+
+    if not is_full_verify:
+        normalised = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            normalised.append({
+                "item_name": item.get("item_name"),
+                "qty_unit": item.get("qty_unit") or item.get("unit") or item.get("uom") or "",
+                "qty_value": float(item.get("qty_value") or item.get("expected_challan_qty") or item.get("incoming_qty") or 0),
+                "challan_rate": item.get("challan_rate"),
+                "po_rate": item.get("po_rate") or item.get("agreed_rate"),
+            })
+        grn.metadata_ = {
+            **grn.metadata_,
+            "challan_no": payload.challan_no if payload.challan_no is not None else grn.metadata_.get("challan_no"),
+            "challan_date": payload.challan_date if payload.challan_date is not None else grn.metadata_.get("challan_date"),
+            "vehicle_no": payload.vehicle_no if payload.vehicle_no is not None else grn.metadata_.get("vehicle_no"),
+            "party_name": payload.supplier_name if payload.supplier_name is not None else grn.metadata_.get("party_name"),
+            "line_items": normalised,
+            "is_draft": True,
+            "verification_status": "CHALLAN_CONFIRMED",
+        }
+        await db.flush()
+        await db.refresh(grn)
+        return grn
+
+    # ── Full GRN verify mode (actual_received_qty present) ──────────────────
+    # Historical cumulative received quantity for this PO (all OTHER GRNs)
+    hist_result = await db.execute(
+        select(func.coalesce(func.sum(GRN.received_quantity), 0.0)).where(
+            GRN.supplier_po_id == grn.supplier_po_id,
+            GRN.id != grn.id,
+        )
+    )
+    historical_qty = float(hist_result.scalar() or 0)
+
+    # Contract reconciliation — rate ceiling + qty discrepancy per line item
     enriched_items = []
     shortage_items = []
+    rate_inflated_items = []
+
     for item in raw_items:
         if not isinstance(item, dict):
             continue
-        expected = float(item.get("expected_challan_qty") or item.get("incoming_qty") or 0)
+
+        challan_qty = float(item.get("qty_value") or item.get("expected_challan_qty") or item.get("incoming_qty") or 0)
+        qty_unit = item.get("qty_unit") or item.get("unit") or item.get("uom") or ""
+        challan_rate = float(item.get("challan_rate") or 0)
+        po_rate = float(item.get("po_rate") or item.get("agreed_rate") or 0)
         actual_raw = item.get("actual_received_qty")
-        if actual_raw is not None:
-            actual = float(actual_raw)
-            variance = actual - expected
-            enriched = {**item, "expected_challan_qty": expected, "actual_received_qty": actual, "variance": variance}
-            if variance < 0:
-                shortage_items.append({
-                    "item_name": item.get("item_name"),
-                    "unit": item.get("unit") or item.get("uom"),
-                    "expected_challan_qty": expected,
-                    "actual_received_qty": actual,
-                    "shortage_qty": abs(variance),
-                })
-        else:
-            enriched = {**item}
+        actual = float(actual_raw) if actual_raw is not None else challan_qty
+        variance = actual - challan_qty
+
+        is_rate_discrepancy = po_rate > 0 and challan_rate > po_rate
+        is_qty_discrepancy = variance < 0
+        shortage_qty = abs(variance) if is_qty_discrepancy else 0.0
+        penalty = round(shortage_qty * (po_rate or challan_rate), 2)
+
+        enriched = {
+            **item,
+            "qty_value": challan_qty,
+            "actual_received_qty": actual,
+            "variance": variance,
+            "is_rate_discrepancy": is_rate_discrepancy,
+            "is_qty_discrepancy": is_qty_discrepancy,
+            "penalty_amount": penalty,
+        }
         enriched_items.append(enriched)
 
-    is_discrepancy = len(shortage_items) > 0
-    debit_note_draft = None
-    if is_discrepancy:
-        # Resolve agreed_rate: prefer value stored on line item at ingest time, fall back to SPO
-        spo_result = await db.execute(select(SupplierPO).where(SupplierPO.id == grn.supplier_po_id))
-        spo_obj = spo_result.scalar_one_or_none()
-        po_rate_fallback = float(spo_obj.agreed_rate) if spo_obj and spo_obj.agreed_rate else 0.0
+        if is_qty_discrepancy:
+            shortage_items.append({
+                "item_name": item.get("item_name"),
+                "qty_unit": qty_unit,
+                "challan_qty": challan_qty,
+                "actual_received_qty": actual,
+                "shortage_qty": shortage_qty,
+                "po_rate": po_rate,
+                "penalty_amount": penalty,
+            })
 
-        total_shortage = 0.0
-        total_penalty = 0.0
-        enriched_shortage_items = []
-        for s in shortage_items:
-            rate = s.get("agreed_rate") or po_rate_fallback
-            penalty = round(s["shortage_qty"] * rate, 2)
-            total_shortage += s["shortage_qty"]
-            total_penalty += penalty
-            enriched_shortage_items.append({**s, "agreed_rate": rate, "penalty_amount": penalty})
+        if is_rate_discrepancy:
+            rate_diff = challan_rate - po_rate
+            rate_inflated_items.append({
+                "item_name": item.get("item_name"),
+                "qty_unit": qty_unit,
+                "challan_qty": challan_qty,
+                "challan_rate": challan_rate,
+                "po_rate": po_rate,
+                "rate_excess": round(rate_diff, 4),
+                "overcharge_amount": round(challan_qty * rate_diff, 2),
+            })
+
+    is_discrepancy = len(shortage_items) > 0 or len(rate_inflated_items) > 0
+    debit_note_draft = None
+
+    if is_discrepancy:
+        total_shortage = sum(s["shortage_qty"] for s in shortage_items)
+        total_penalty = sum(s["penalty_amount"] for s in shortage_items)
+        total_overcharge = sum(r["overcharge_amount"] for r in rate_inflated_items)
 
         challan_ref = payload.challan_no or grn.metadata_.get("challan_no") or grn.grn_number
-        party = grn.metadata_.get("party_name") or grn.metadata_.get("supplier_name", "")
-        item_summary = ", ".join(
-            f"{s['shortage_qty']} {s['unit']} of {s['item_name']}" for s in enriched_shortage_items
-        )
+        party = grn.metadata_.get("party_name") or ""
+
+        parts = []
+        if shortage_items:
+            summary = ", ".join(
+                f"{s['shortage_qty']} {s['qty_unit']} of {s['item_name']}" for s in shortage_items
+            )
+            parts.append(f"Short delivery: {summary}")
+        if rate_inflated_items:
+            summary = ", ".join(
+                f"{r['item_name']} @ ₹{r['challan_rate']} vs PO ₹{r['po_rate']}" for r in rate_inflated_items
+            )
+            parts.append(f"Rate inflation: {summary}")
+
         auto_justification = (
-            f"Short delivery on challan {challan_ref}. Physical gate count recorded shortage: "
-            f"{item_summary}. Total penalty: ₹{round(total_penalty, 2)}."
+            f"Challan {challan_ref}" + (f" from {party}" if party else "") +
+            ": " + "; ".join(parts) +
+            f". Total penalty: ₹{round(total_penalty + total_overcharge, 2)}."
         )
+
         debit_note_draft = {
             "challan_no": challan_ref,
             "party_name": party,
             "raised_on_style": style_number,
-            "shortage_items": enriched_shortage_items,
+            "shortage_items": shortage_items,
+            "rate_inflated_items": rate_inflated_items,
             "total_shortage_qty": total_shortage,
             "total_penalty_amount": round(total_penalty, 2),
+            "total_overcharge_amount": round(total_overcharge, 2),
             "justification": payload.justification or auto_justification,
             "status": "DRAFT",
         }
 
-    # received_quantity reflects actual gate count total (or expected if gate count not entered)
-    grn.received_quantity = sum(
-        float(item.get("actual_received_qty") or item.get("incoming_qty") or 0)
-        for item in enriched_items if isinstance(item, dict)
-    ) or grn.received_quantity
+    current_actual_total = sum(
+        float(item.get("actual_received_qty") or 0) for item in enriched_items if isinstance(item, dict)
+    )
+    grn.received_quantity = current_actual_total or grn.received_quantity
 
     grn.metadata_ = {
         **grn.metadata_,
@@ -361,6 +462,8 @@ async def verify_grn(
         "line_items": enriched_items,
         "debit_note_draft": debit_note_draft,
         "is_discrepancy": is_discrepancy,
+        "historical_cumulative_qty": historical_qty,
+        "cumulative_after_grn": historical_qty + current_actual_total,
         "is_draft": False,
         "verification_status": "VERIFIED",
     }
@@ -386,16 +489,23 @@ async def ingest_detailed_grn(
     supplier = await _require_supplier(db, supplier_id)
 
     content = await file.read()
+    # Normalise MIME type — browsers sometimes send wrong content-type for images
     mime = file.content_type or "application/pdf"
+    fname = (file.filename or "").lower()
+    if mime not in {"application/pdf", "image/jpeg", "image/png"}:
+        if fname.endswith((".jpg", ".jpeg")):
+            mime = "image/jpeg"
+        elif fname.endswith(".png"):
+            mime = "image/png"
+
     s3_key = await s3_storage.upload_document(file, folder="grns")
     parsed = await openrouter_ai.parse_grn(content, mime)
 
-    raw_items = parsed.get("line_items") or []
+    parse_failed = not parsed.get("success", True)
+    raw_items = [] if parse_failed else (parsed.get("line_items") or [])
     if not isinstance(raw_items, list):
         raw_items = []
 
-    # Inherit agreed_rate from the SPO so the verify step can compute penalty amounts
-    # without a second DB lookup.
     po_rate = float(spo.agreed_rate) if spo.agreed_rate else None
 
     line_items = []
@@ -404,14 +514,15 @@ async def ingest_detailed_grn(
             continue
         line_items.append({
             "item_name": item.get("item_name"),
-            "unit": item.get("unit") or item.get("uom"),
-            "expected_challan_qty": float(item.get("expected_challan_qty") or item.get("incoming_qty") or 0),
+            "qty_unit": item.get("qty_unit") or item.get("unit") or item.get("uom"),
+            "qty_value": float(item.get("qty_value") or item.get("expected_challan_qty") or item.get("incoming_qty") or 0),
+            "challan_rate": None,
+            "po_rate": po_rate,
             "actual_received_qty": None,
             "variance": None,
-            "agreed_rate": po_rate,
         })
 
-    total_expected = sum(i["expected_challan_qty"] for i in line_items) or None
+    total_expected = sum(i["qty_value"] for i in line_items) or None
 
     received_date_raw = parsed.get("received_date") or parsed.get("challan_date")
     try:
@@ -434,8 +545,10 @@ async def ingest_detailed_grn(
             "line_items": line_items,
             "debit_note_draft": None,
             "is_discrepancy": False,
-            "extra_fields": parsed.get("extra_fields", {}),
+            "parse_failed": parse_failed,
+            "parse_error_reason": parsed.get("reason") if parse_failed else None,
             "file_url": s3_key,
+            "file_mime": mime,
             "is_draft": True,
             "verification_status": "PENDING_VERIFICATION",
         },
@@ -533,7 +646,8 @@ async def verify_supplier_invoice(
     if payload.supplier_po_id is not None:
         invoice.supplier_po_id = payload.supplier_po_id
     if payload.metadata_ is not None:
-        invoice.metadata_ = payload.metadata_
+        # Merge so AI-extracted fields not present in the verify form are preserved
+        invoice.metadata_ = {**invoice.metadata_, **payload.metadata_}
 
     invoice.is_draft = False
     invoice.verification_status = VerificationStatus.VERIFIED

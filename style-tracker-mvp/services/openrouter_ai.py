@@ -41,7 +41,8 @@ Required top-level keys (include whatever is present; use null for absent fields
 }
 
 Rules:
-- "sub_buyer_name": Optional. Extract a third-party brand name, buying agent, or middleman if printed on the document and distinct from the primary buyer. Use null if not found.
+- "buyer_name": The entity that ISSUED this Purchase Order — the company or person placing the order and signing it. This is typically the main letterhead name, the "From" party, or the entity whose PO number this is.
+- "sub_buyer_name": The end brand or third party this order is ultimately being sourced FOR. Look for phrases like "on behalf of", "for account of", "for:", "on account of", "sourced for", "client:", "end buyer:", or any similar delegation language on the document. Extract the name that follows such a phrase. Use null if no such phrase or third-party reference is present.
 - "size_breakdown": A JSON object mapping size tokens to their integer quantities, e.g. {"XS": 50, "S": 150, "M": 300, "L": 150, "XL": 100}. Extract every row from any quantity breakdown table, size grid, or colour-size matrix on the document. Aggregate across colours if necessary — keys must be size tokens only. Use an empty object {} if no size breakdown is present.
 - "total_quantity": The absolute total order quantity as an integer. If "size_breakdown" is populated, this MUST equal the mathematical sum of all values in that dictionary. Otherwise extract whatever total quantity is printed.
 - Put any field not listed above into "extra_fields".
@@ -123,6 +124,9 @@ async def _call_deepseek(file_bytes: bytes, mime_type: str, prompt: str = DOCUME
     if mime_type == "application/pdf":
         doc_text = _extract_pdf_text(file_bytes)
         user_content = f"{prompt}\n\nDocument text:\n{doc_text or '[no extractable text]'}"
+    elif mime_type.startswith("image/"):
+        # DeepSeek is text-only; cannot process raw image bytes — return structured parse failure
+        return {"success": False, "reason": "image content requires a vision model; DeepSeek cannot process it", "line_items": []}
     else:
         user_content = f"{prompt}\n\n[Image data omitted — return best-guess empty structure]"
 
@@ -160,11 +164,18 @@ async def parse_supplier_po(file_bytes: bytes, mime_type: str = "application/pdf
 
 
 GRN_PARSE_PROMPT = """You are a document parser for a garment manufacturing warehouse system.
-Extract all structured data from this Goods Received Note (GRN), delivery challan, or material receipt document.
+Extract structured data from this Goods Received Note (GRN), delivery challan, or material receipt.
 Return ONLY valid JSON — no markdown, no explanation, no code fences.
 
-Required top-level keys (use null for absent fields):
+CRITICAL LEGIBILITY CHECK — evaluate this FIRST:
+If the document is a phone photograph of a handwritten challan, ink-stamped form, or any document where
+text is illegible, overlapping, blurry, or too messy to read with confidence, you MUST immediately return:
+{"success": false, "reason": "data is too messy to read", "line_items": []}
+Do NOT attempt to guess values from illegible content.
+
+If the document IS legible, return the full extraction with "success": true:
 {
+  "success": true,
   "challan_no": null,
   "challan_date": null,
   "vehicle_no": null,
@@ -174,22 +185,20 @@ Required top-level keys (use null for absent fields):
   "line_items": [
     {
       "item_name": null,
-      "expected_challan_qty": null,
-      "unit": null
+      "qty_value": null,
+      "qty_unit": null
     }
-  ],
-  "extra_fields": {}
+  ]
 }
 
-Rules:
-- "line_items" MUST be a JSON array. If there is only one item, still return it as a single-element array.
-- "expected_challan_qty" must be a number (not a string). Extract the quantity the supplier claims to have delivered per row.
-- "unit" (unit of measurement) should be one of: CONE, BOX, GRS, PCS, MTR, KG, SET, ROLL — or whatever unit is printed.
+Rules (apply only when legible):
+- "line_items" MUST be a JSON array. If only one item, return as a single-element array.
+- "qty_value" must be a number. Extract the quantity the supplier claims to have delivered per row.
+- "qty_unit" should be one of: CONE, BOX, GRS, PCS, MTR, KG, SET, ROLL — or whatever unit is printed.
 - "challan_no" is the delivery challan number or document reference number.
-- "party_name" is the supplier or seller name printed on the challan.
+- "party_name" is the supplier or seller name.
 - "grn_number" is the internal GRN reference if printed; otherwise null.
-- "received_date" and "challan_date" must be ISO date strings (YYYY-MM-DD) if extractable, otherwise null.
-- Put any field not listed above into "extra_fields".
+- "challan_date" and "received_date" must be ISO date strings (YYYY-MM-DD) if extractable, otherwise null.
 """
 
 
