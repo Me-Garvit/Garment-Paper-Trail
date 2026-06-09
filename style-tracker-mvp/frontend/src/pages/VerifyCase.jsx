@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { getCase, verifyCase } from '../api/client'
+import { getCase, verifyCase, createCase } from '../api/client'
 import { VerificationBadge } from '../components/StatusBadge'
+import UploadModal from '../components/UploadModal'
 
 export default function VerifyCase() {
   const { styleNumber } = useParams()
@@ -15,6 +16,21 @@ export default function VerifyCase() {
   const [subBuyer, setSubBuyer] = useState('')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState(null)
+  const [showReupload, setShowReupload] = useState(false)
+  const [replacingDoc, setReplacingDoc] = useState(false)
+
+  const handleReplaceDoc = async (file) => {
+    setReplacingDoc(true)
+    try {
+      const updated = await createCase(file)
+      setShowReupload(false)
+      navigate(`/cases/${encodeURIComponent(updated.style_number)}/verify`)
+    } catch (e) {
+      setError(e.response?.data?.detail ?? 'Re-upload failed')
+    } finally {
+      setReplacingDoc(false)
+    }
+  }
 
   useEffect(() => {
     getCase(decoded).then(d => {
@@ -329,8 +345,11 @@ export default function VerifyCase() {
 
         {/* Right — PDF viewer */}
         <div className="w-1/2 bg-gray-800 flex flex-col">
-          <div className="px-4 py-2.5 bg-gray-900 text-xs text-gray-400 font-medium border-b border-gray-700 shrink-0">
-            Original Document
+          <div className="px-4 py-2.5 bg-gray-900 text-xs text-gray-400 font-medium border-b border-gray-700 shrink-0 flex items-center justify-between">
+            <span>Original Document</span>
+            <button onClick={() => setShowReupload(true)} className="text-gray-500 hover:text-white text-[10px] font-medium transition">
+              ↑ Replace
+            </button>
           </div>
           {draft.document_url ? (
             <iframe
@@ -345,6 +364,16 @@ export default function VerifyCase() {
           )}
         </div>
       </div>
+
+      {showReupload && (
+        <UploadModal
+          title="Replace Buyer PO Document"
+          description="Upload the correct Buyer PO. AI will re-parse and refresh the form."
+          onUpload={handleReplaceDoc}
+          onClose={() => setShowReupload(false)}
+          loading={replacingDoc}
+        />
+      )}
     </div>
   )
 }

@@ -4,7 +4,8 @@
 
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { getGRN, getSupplierPO, verifyGRN } from '../api/client'
+import { getGRN, getSupplierPO, verifyGRN, replaceGRNDocument } from '../api/client'
+import UploadModal from '../components/UploadModal'
 
 const UOM_OPTIONS = ['CONE', 'BOX', 'GRS', 'PCS', 'MTR', 'KG', 'SET', 'ROLL']
 
@@ -23,8 +24,45 @@ export default function VerifyGRN() {
   const [lineItems, setLineItems] = useState([])
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState(null)
+  const [showReupload, setShowReupload] = useState(false)
+  const [replacingDoc, setReplacingDoc] = useState(false)
 
   const poLineItems = spo?.metadata_?.line_items || []
+
+  const handleReplaceDoc = async (file) => {
+    setReplacingDoc(true)
+    try {
+      const updated = await replaceGRNDocument(decoded, supplierId, poId, grnId, file)
+      setShowReupload(false)
+      // Reload in-place: update grn state and re-seed form
+      setGrn(updated)
+      const meta = updated.metadata_ || {}
+      setHeader(h => ({
+        ...h,
+        challan_no: meta.challan_no || '',
+        challan_date: meta.challan_date || '',
+        vehicle_no: meta.vehicle_no || '',
+        supplier_name: meta.party_name || meta.supplier_name || '',
+      }))
+      const raw = Array.isArray(meta.line_items) ? meta.line_items : []
+      setLineItems(
+        raw.length > 0
+          ? raw.map(r => ({
+              item_name: r.item_name || '',
+              qty_value: String(r.qty_value ?? ''),
+              qty_unit: r.qty_unit || 'PCS',
+              challan_rate: String(r.challan_rate ?? ''),
+              po_rate: r.po_rate ?? null,
+              po_item_idx: '',
+            }))
+          : [emptyRow()]
+      )
+    } catch (e) {
+      setError(e.response?.data?.detail ?? 'Re-upload failed')
+    } finally {
+      setReplacingDoc(false)
+    }
+  }
 
   useEffect(() => {
     Promise.all([
@@ -283,8 +321,11 @@ export default function VerifyGRN() {
 
         {/* Right — challan document */}
         <div className="w-1/2 bg-gray-800 flex flex-col">
-          <div className="px-4 py-2.5 bg-gray-900 text-xs text-gray-400 font-medium border-b border-gray-700 shrink-0">
-            Original Challan Document
+          <div className="px-4 py-2.5 bg-gray-900 text-xs text-gray-400 font-medium border-b border-gray-700 shrink-0 flex items-center justify-between">
+            <span>Original Challan Document</span>
+            <button onClick={() => setShowReupload(true)} className="text-gray-500 hover:text-white text-[10px] font-medium transition">
+              ↑ Replace
+            </button>
           </div>
           {grn.document_url ? (
             fileMime.startsWith('image/') ? (
@@ -297,6 +338,16 @@ export default function VerifyGRN() {
           )}
         </div>
       </div>
+
+      {showReupload && (
+        <UploadModal
+          title="Replace Challan Document"
+          description="Upload the correct delivery challan (PDF or photo). AI will re-parse header and items. Your GRN number is preserved."
+          onUpload={handleReplaceDoc}
+          onClose={() => setShowReupload(false)}
+          loading={replacingDoc}
+        />
+      )}
     </div>
   )
 }

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { getSupplierInvoice, listSupplierPOs, verifyInvoice } from '../api/client'
+import { getSupplierInvoice, listSupplierPOs, verifyInvoice, uploadInvoice } from '../api/client'
+import UploadModal from '../components/UploadModal'
 import DiscrepancyFlags from '../components/DiscrepancyFlags'
 import { VerificationBadge } from '../components/StatusBadge'
 
@@ -18,6 +19,21 @@ export default function VerifyInvoice() {
   const [lineItems, setLineItems] = useState([])
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState(null)
+  const [showReupload, setShowReupload] = useState(false)
+  const [replacingDoc, setReplacingDoc] = useState(false)
+
+  const handleReplaceDoc = async (file) => {
+    setReplacingDoc(true)
+    try {
+      const newInv = await uploadInvoice(decoded, supplierId, file)
+      setShowReupload(false)
+      navigate(`/cases/${styleNumber}/suppliers/${supplierId}/invoices/${newInv.id}/verify`)
+    } catch (e) {
+      setError(e.response?.data?.detail ?? 'Re-upload failed')
+    } finally {
+      setReplacingDoc(false)
+    }
+  }
 
   useEffect(() => {
     getSupplierInvoice(decoded, supplierId, invoiceId)
@@ -346,8 +362,11 @@ export default function VerifyInvoice() {
 
         {/* Right — PDF viewer */}
         <div className="w-1/2 bg-gray-800 flex flex-col">
-          <div className="px-4 py-2.5 bg-gray-900 text-xs text-gray-400 font-medium border-b border-gray-700 shrink-0">
-            Original Invoice Document
+          <div className="px-4 py-2.5 bg-gray-900 text-xs text-gray-400 font-medium border-b border-gray-700 shrink-0 flex items-center justify-between">
+            <span>Original Invoice Document</span>
+            <button onClick={() => setShowReupload(true)} className="text-gray-500 hover:text-white text-[10px] font-medium transition">
+              ↑ Replace
+            </button>
           </div>
           {invoice.document_url ? (
             <iframe
@@ -362,6 +381,16 @@ export default function VerifyInvoice() {
           )}
         </div>
       </div>
+
+      {showReupload && (
+        <UploadModal
+          title="Replace Invoice Document"
+          description="Upload the correct invoice. AI will re-parse and open a fresh verify page."
+          onUpload={handleReplaceDoc}
+          onClose={() => setShowReupload(false)}
+          loading={replacingDoc}
+        />
+      )}
     </div>
   )
 }

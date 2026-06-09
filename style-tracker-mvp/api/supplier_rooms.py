@@ -165,6 +165,33 @@ async def get_supplier_po(
     return resp
 
 
+@router.delete("/{supplier_id}/pos/{po_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_supplier_po(
+    style_number: str,
+    supplier_id: int,
+    po_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    spo = await _require_supplier_po(db, po_id, style_number, supplier_id)
+    # Block deletion if verified GRNs or invoices are already linked
+    grn_result = await db.execute(select(GRN).where(GRN.supplier_po_id == po_id))
+    if grn_result.scalars().first():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot delete — this PO has GRNs logged against it. Delete the GRNs first.",
+        )
+    inv_result = await db.execute(
+        select(SupplierInvoice).where(SupplierInvoice.supplier_po_id == po_id)
+    )
+    if inv_result.scalars().first():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot delete — this PO has invoices linked to it.",
+        )
+    await db.delete(spo)
+    await db.flush()
+
+
 @router.patch("/{supplier_id}/pos/{po_id}/verify", response_model=SupplierPOResponse)
 async def verify_supplier_po(
     style_number: str,
@@ -268,6 +295,75 @@ async def list_grns(
         )
     )
     return result.scalars().all()
+
+
+@router.patch("/{supplier_id}/pos/{po_id}/grns/{grn_id}/document", response_model=GRNResponse)
+async def replace_grn_document(
+    style_number: str,
+    supplier_id: int,
+    po_id: int,
+    grn_id: int,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Replace the challan document on an existing GRN draft and re-run AI header+item parse."""
+    grn = await _require_grn(db, grn_id, po_id, supplier_id, style_number)
+    spo = await _require_supplier_po(db, po_id, style_number, supplier_id)
+
+    content = await file.read()
+    mime = file.content_type or "application/pdf"
+    fname = (file.filename or "").lower()
+    if mime not in {"application/pdf", "image/jpeg", "image/png"}:
+        if fname.endswith((".jpg", ".jpeg")):
+            mime = "image/jpeg"
+        elif fname.endswith(".png"):
+            mime = "image/png"
+
+    s3_key = await s3_storage.upload_document(file, folder="grns")
+    parsed = await openrouter_ai.parse_grn(content, mime)
+    parse_failed = not parsed.get("success", True)
+    raw_items = [] if parse_failed else (parsed.get("line_items") or [])
+    if not isinstance(raw_items, list):
+        raw_items = []
+
+    po_rate = float(spo.agreed_rate) if spo.agreed_rate else None
+    line_items = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        line_items.append({
+            "item_name": item.get("item_name"),
+            "qty_unit": item.get("qty_unit") or item.get("unit") or item.get("uom"),
+            "qty_value": float(item.get("qty_value") or item.get("expected_challan_qty") or item.get("incoming_qty") or 0),
+            "challan_rate": None,
+            "po_rate": po_rate,
+            "actual_received_qty": None,
+            "variance": None,
+        })
+
+    grn.metadata_ = {
+        **grn.metadata_,
+        "challan_no": parsed.get("challan_no") or grn.metadata_.get("challan_no"),
+        "challan_date": parsed.get("challan_date") or grn.metadata_.get("challan_date"),
+        "vehicle_no": parsed.get("vehicle_no") or grn.metadata_.get("vehicle_no"),
+        "party_name": parsed.get("party_name") or grn.metadata_.get("party_name"),
+        "line_items": line_items,
+        "parse_failed": parse_failed,
+        "parse_error_reason": parsed.get("reason") if parse_failed else None,
+        "file_url": s3_key,
+        "file_mime": mime,
+        "is_draft": True,
+        "verification_status": "PENDING_VERIFICATION",
+    }
+    await db.flush()
+    await db.refresh(grn)
+
+    resp = GRNResponse.model_validate(grn)
+    try:
+        resp.document_url = s3_storage.generate_presigned_url(s3_key)
+    except Exception:
+        pass
+    return resp
 
 
 @router.get("/{supplier_id}/pos/{po_id}/grns/{grn_id}", response_model=GRNResponse)

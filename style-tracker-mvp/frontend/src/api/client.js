@@ -59,6 +59,9 @@ export const verifySupplierPO = (styleNumber, supplierId, poId, payload) =>
     payload,
   ).then(r => r.data)
 
+export const deleteSupplierPO = (styleNumber, supplierId, poId) =>
+  api.delete(`/cases/${encodeURIComponent(styleNumber)}/suppliers/${supplierId}/pos/${poId}`)
+
 // ── GRNs ───────────────────────────────────────────────────────────────────
 
 export const listGRNs = (styleNumber, supplierId, poId) =>
@@ -81,6 +84,15 @@ export const verifyGRN = (styleNumber, supplierId, poId, grnId, payload) =>
     `/cases/${encodeURIComponent(styleNumber)}/suppliers/${supplierId}/pos/${poId}/grns/${grnId}/verify`,
     payload,
   ).then(r => r.data)
+
+export const replaceGRNDocument = (styleNumber, supplierId, poId, grnId, file) => {
+  const form = new FormData()
+  form.append('file', file)
+  return api.patch(
+    `/cases/${encodeURIComponent(styleNumber)}/suppliers/${supplierId}/pos/${poId}/grns/${grnId}/document`,
+    form,
+  ).then(r => r.data)
+}
 
 export const ingestDetailedGRN = (styleNumber, supplierId, poId, file) => {
   const form = new FormData()
